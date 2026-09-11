@@ -110,7 +110,7 @@ extern "C" {
 BOOL DebuggerInitialised;
 
 LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo);
-SINGLE_STEP_HANDLER SingleStepHandler;
+SINGLE_STEP_HANDLER SingleStepHandler, SoftBPSingleStepHandler;
 PVOID CAPEExceptionFilterHandle;
 PEXCEPTION_ROUTINE SEH_TopLevelHandler;
 LPTOP_LEVEL_EXCEPTION_FILTER OriginalExceptionHandler;
@@ -181,7 +181,7 @@ BOOL InitialiseDebugger(void);
 BOOL ResumeFromBreakpoint(PCONTEXT Context);
 void OutputThreadBreakpoints(DWORD ThreadId);
 void DebugOutputThreadBreakpoints();
-BOOL PatchByte(LPVOID Address, BYTE Byte);
+BOOL PatchBytes(LPVOID Address, const char* HexBytes);
 
 void ShowStack(DWORD_PTR StackPointer, unsigned int NumberOfRecords);
 

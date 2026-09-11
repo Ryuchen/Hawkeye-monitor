@@ -30,6 +30,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#define EXCEPTION_CHAIN_END ((PEXCEPTION_REGISTRATION_RECORD)-1)
+
 #ifndef _MSC_VER
 #define __out
 #define __in
@@ -312,7 +314,9 @@ typedef enum _SYSTEM_INFORMATION_CLASS {
 	SystemVdmBopInformation,
 	SystemFileCacheInformation,
 	SystemInterruptInformation = 23,
-	SystemExceptionInformation = 33
+	SystemExceptionInformation = 33,
+	SystemHypervisorDetailInformation = 159,
+	SystemCodeIntegrityPolicyInformation = 164
 } SYSTEM_INFORMATION_CLASS, *PSYSTEM_INFORMATION_CLASS;
 
 typedef struct _SYSTEM_BASIC_INFORMATION {
@@ -524,6 +528,22 @@ typedef struct _PROC_THREAD_ATTRIBUTE_LIST
 
 typedef void *PVOID, **PPVOID;
 
+typedef struct _LDR_MODULE {
+	LIST_ENTRY InLoadOrderModuleList;
+	LIST_ENTRY InMemoryOrderModuleList;
+	LIST_ENTRY InInitializationOrderModuleList;
+	PVOID BaseAddress;
+	PVOID EntryPoint;
+	ULONG SizeOfImage;
+	UNICODE_STRING FullDllName;
+	UNICODE_STRING BaseDllName;
+	ULONG Flags;
+	SHORT LoadCount;
+	SHORT TlsIndex;
+	LIST_ENTRY HashTableEntry;
+	ULONG TimeDateStamp;
+} LDR_MODULE, * PLDR_MODULE;
+
 typedef struct _PEB_LDR_DATA {
 	ULONG Length;
 	BOOLEAN Initialized;
@@ -604,7 +624,7 @@ typedef struct _PEB {
 	PVOID PostProcessInitRoutine;
 	BYTE Reserved4[136];
 	ULONG SessionId;
-} PEB;
+} PEB, *PPEB;
 #else
 typedef struct _PEB {
 	BOOLEAN InheritedAddressSpace;
@@ -663,6 +683,18 @@ typedef struct _PEB {
 	ULONG   SessionId;
 } PEB, *PPEB;
 #endif
+
+typedef struct _TEB
+{
+	NT_TIB NtTib;
+	PVOID EnvironmentPointer;
+	CLIENT_ID ClientId;
+	PVOID ActiveRpcHandle;
+	PVOID ThreadLocalStoragePointer;
+	PPEB ProcessEnvironmentBlock;
+	ULONG LastErrorValue;
+// truncated
+} TEB, *PTEB;
 
 typedef enum _DBG_STATE
 {
@@ -1002,6 +1034,13 @@ typedef struct _TIMER_SET_COALESCABLE_TIMER_INFO {
 	ULONG TolerableDelay;
 	PBOOLEAN PreviousState;
 } TIMER_SET_COALESCABLE_TIMER_INFO, *PTIMER_SET_COALESCABLE_TIMER_INFO;
+
+typedef struct _WTS_PROCESS_INFOW {
+	DWORD  SessionId;
+	DWORD  ProcessId;
+	LPWSTR pProcessName;
+	PSID   pUserSid;
+} WTS_PROCESS_INFOW, *PWTS_PROCESS_INFOW;
 
 typedef BOOL(WINAPI *LPFN_ISWOW64PROCESS) (HANDLE, PBOOL);
 

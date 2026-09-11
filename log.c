@@ -255,39 +255,230 @@ static void log_ptr(void *value)
 static void log_string(const char *str, int length)
 {
 	int ret;
-	char *utf8s;
+	char stack_buf[2048];
+	char *utf8s = stack_buf;
 	int utf8len;
+	BOOL allocated = FALSE;
 
 	if (str == NULL) {
 		bson_append_string_n( g_bson, g_istr, "", 0 );
 		return;
 	}
-	utf8s = utf8_string(str, length);
-	utf8len = * (int *) utf8s;
+
+	if (length == -1)
+		length = (int)strlen(str);
+
+	utf8len = utf8_strlen_ascii(str, length);
+	if (utf8len + 4 > sizeof(stack_buf)) {
+		utf8s = malloc(utf8len + 4);
+		allocated = TRUE;
+	}
+
+	if (utf8s == NULL) {
+		bson_append_string_n(g_bson, g_istr, "", 0);
+		return;
+	}
+
+	*((int *) utf8s) = utf8len;
+	int pos = 4;
+	const char *p = str;
+	int temp_len = length;
+	while (temp_len-- != 0) {
+		pos += utf8_do_encode(*p++, (unsigned char *) &utf8s[pos]);
+	}
+
 	ret = bson_append_binary( g_bson, g_istr, BSON_BIN_BINARY, utf8s+4, utf8len );
 	if (ret == BSON_ERROR) {
 		bson_append_string_n(g_bson, g_istr, "", 0);
 	}
-	free(utf8s);
+
+	if (allocated) {
+		free(utf8s);
+	}
 }
 
 static void log_wstring(const wchar_t *str, int length)
 {
 	int ret;
-	char *utf8s;
+	char stack_buf[2048];
+	char *utf8s = stack_buf;
 	int utf8len;
+	BOOL allocated = FALSE;
 
 	if (str == NULL) {
 		bson_append_string_n( g_bson, g_istr, "", 0 );
 		return;
 	}
-	utf8s = utf8_wstring(str, length);
-	utf8len = * (int *) utf8s;
+
+	if (length == -1)
+		length = lstrlenW(str);
+
+	utf8len = utf8_strlen_unicode(str, length);
+	if (utf8len + 4 > sizeof(stack_buf)) {
+		utf8s = malloc(utf8len + 4);
+		allocated = TRUE;
+	}
+
+	if (utf8s == NULL) {
+		bson_append_string_n(g_bson, g_istr, "", 0);
+		return;
+	}
+
+	*((int *) utf8s) = utf8len;
+	int pos = 4;
+	const wchar_t *p = str;
+	int temp_len = length;
+	while (temp_len-- != 0) {
+		pos += utf8_do_encode(*p++, (unsigned char *) &utf8s[pos]);
+	}
+
 	ret = bson_append_binary( g_bson, g_istr, BSON_BIN_BINARY, utf8s+4, utf8len );
 	if (ret == BSON_ERROR) {
 		bson_append_string_n(g_bson, g_istr, "", 0);
 	}
-	free(utf8s);
+
+	if (allocated) {
+		free(utf8s);
+	}
+}
+
+static void log_variant(VARIANT* var) {
+	char log_msg[32];
+	if (!var) {
+		// Log an empty string instead of bailing to avoid gaps in the BSON array
+		log_string("", 0);
+		return;
+	}
+
+	__try {
+		switch (var->vt) {
+			case VT_EMPTY:
+				log_string("", 0);
+				break;
+			case VT_NULL:
+				log_string("NULL", -1);
+				break;
+			case 74:
+				// Undocumented, likely internal Variant Type in vbscript engine
+				// Observed with:
+				// Return value (arg1) with VbsStrReverse
+				// Function argument (arg3) with VbsExecute
+				log_variant((VARIANT*)var->pvRecord);
+				break;
+			case 130:
+				log_wstring(var->bstrVal, -1);
+				break;
+			case VT_BSTR:
+				log_wstring(var->bstrVal, -1);
+				break;
+			case VT_BSTR | VT_BYREF:
+				log_wstring(var->pbstrVal ? *var->pbstrVal : NULL, -1);
+				break;
+			case VT_BOOL:
+				if (var->boolVal)
+					log_string("TRUE", 4);
+				else
+					log_string("FALSE", 5);
+				break;
+			case VT_BOOL | VT_BYREF:
+				if (*var->pboolVal)
+					log_string("TRUE", 4);
+				else
+					log_string("FALSE", 5);
+				break;
+			case VT_INT:
+				log_int32(var->intVal);
+				break;
+			case VT_INT | VT_BYREF:
+				log_int32(*var->pintVal);
+				break;
+			case VT_UINT:
+				log_int32(var->uintVal);
+				break;
+			case VT_UINT | VT_BYREF:
+				log_int32(*var->puintVal);
+				break;
+			case VT_I8:
+				log_int64(var->llVal);
+				break;
+			case VT_I8 | VT_BYREF:
+				log_int64(*var->pllVal);
+				break;
+			case VT_UI8:
+				log_int64(var->ullVal);
+				break;
+			case VT_UI8 | VT_BYREF:
+				log_int64(*var->pullVal);
+				break;
+			case VT_I4:
+				log_int32(var->lVal);
+				break;
+			case VT_I4 | VT_BYREF:
+				log_int32(*var->plVal);
+				break;
+			case VT_UI4:
+				log_int32(var->ulVal);
+				break;
+			case VT_UI4 | VT_BYREF:
+				log_int32(*var->pulVal);
+				break;
+			case VT_I2:
+				log_int32(var->iVal);
+				break;
+			case VT_I2 | VT_BYREF:
+				log_int32(*var->piVal);
+				break;
+			case VT_UI2:
+				log_int32(var->uiVal);
+				break;
+			case VT_UI2 | VT_BYREF:
+				log_int32(*var->puiVal);
+				break;
+			case VT_I1:
+				log_int32(var->cVal);
+				break;
+			case VT_I1 | VT_BYREF:
+				log_int32(*var->pcVal);
+				break;
+			case VT_UI1:
+				log_int32(var->bVal);
+				break;
+			case VT_UI1 | VT_BYREF:
+				log_int32(*var->pbVal);
+				break;
+			case VT_VARIANT:
+				log_variant(var->pvarVal);
+				break;
+			case VT_VARIANT | VT_BYREF:
+				log_variant(var->pvarVal);
+				break;
+			case VT_DATE:
+				// Note: Maybe convert to a datestamp?
+				log_int64((int64_t)var->date);
+				break;
+			case VT_DATE | VT_BYREF:
+				// Note: Maybe convert to a datestamp string?
+				log_int64((int64_t)*var->pdate);
+				break;
+			case VT_R8:
+				log_int64((int64_t)var->dblVal);
+				break;
+			case VT_R8 | VT_BYREF:
+				log_int64((int64_t)*var->pdblVal);
+				break;
+			default:
+				if (var->vt & VT_ARRAY)
+					log_string("Array", 5);
+				else {
+					snprintf(log_msg, 32, "Unhandled VARIANT Type: %hu", var->vt);
+					log_string(log_msg, -1);
+				}
+				break;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		log_string("", 0);
+	}
 }
 
 static void log_argv(int argc, const char ** argv) {
@@ -369,7 +560,22 @@ void loq(int index, const char *category, const char *name,
 	hook_disable();
 
 	if (!TryEnterCriticalSection(&g_mutex))
-		goto exit;
+	{
+		int retries = 100;
+		BOOL acquired = FALSE;
+
+		while (retries-- > 0) {
+			if (TryEnterCriticalSection(&g_mutex)) {
+				acquired = TRUE;
+				break;
+			}
+			SwitchToThread();
+		}
+
+		if (!acquired) {
+			goto exit;
+		}
+	}
 
 	if (!special_api_triggered)
 		last_api_logged = API_OTHER;
@@ -481,6 +687,9 @@ void loq(int index, const char *category, const char *name,
 			}
 			else if (key == 'l' || key == 'L') {
 				(void)va_arg(args, ULONG_PTR);
+			}
+			else if (key == 'n') {
+				(void)va_arg(args, VARIANT *);
 			}
 			else if (key == 'p' || key == 'P') {
 				(void)va_arg(args, void *);
@@ -663,6 +872,10 @@ void loq(int index, const char *category, const char *name,
 				;
 			}
 			log_ptr(theptr);
+		}
+		else if (key == 'n') {
+			VARIANT* s = va_arg(args, VARIANT*);
+			log_variant(s);
 		}
 		else if (key == 'x') {
 			LARGE_INTEGER value = va_arg(args, LARGE_INTEGER);

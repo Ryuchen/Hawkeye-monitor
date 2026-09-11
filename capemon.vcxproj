@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -21,7 +21,7 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{15C69A24-71D1-4A1A-B39B-0466181ACD7E}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
-    <WindowsTargetPlatformVersion>10.0.22000.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
     <ProjectName>capemon</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -94,10 +94,11 @@
     <TargetName>capemon_x64</TargetName>
     <TargetExt>.dll</TargetExt>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\WTL91\Include;</IncludePath>
+    <GenerateManifest>false</GenerateManifest>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
-      <PreprocessorDefinitions>CUCKOODBG;WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS_DEBUG;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;%(PreprocessorDefinitions);_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CUCKOODBG;WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS_DEBUG;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
@@ -122,7 +123,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>CUCKOODBG;WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS_DEBUG;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;%(PreprocessorDefinitions);_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CUCKOODBG;WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS_DEBUG;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
@@ -133,10 +134,11 @@
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>libyara64.lib;crypt32.lib;ws2_32.lib;shlwapi.lib;bson.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libyara64.lib;crypt32.lib;ws2_32.lib;shlwapi.lib;bson.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(ProjectDir)x64\Debug;$(ProjectDir)\libyara\lib</AdditionalLibraryDirectories>
       <BaseAddress>0x30000000</BaseAddress>
       <SetChecksum>true</SetChecksum>
+      <DelayLoadDLLs>advapi32.dll;user32.dll;ws2_32.dll;crypt32.dll;shlwapi.dll;ole32.dll;shell32.dll;oleaut32.dll;netapi32.dll;bcrypt.dll</DelayLoadDLLs>
     </Link>
     <PreBuildEvent>
       <Command>
@@ -145,12 +147,13 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGSNDEBUG;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;%(PreprocessorDefinitions);_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGSNDEBUG;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <AdditionalIncludeDirectories>.\libyara\include;.\bson;.\distorm\include;C:\Program Files (x86)\Microsoft Visual Studio 11.0\VC\WTL81\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ControlFlowGuard>false</ControlFlowGuard>
       <EnablePREfast>false</EnablePREfast>
       <EnableEnhancedInstructionSet>NoExtensions</EnableEnhancedInstructionSet>
       <AdditionalOptions>/Qsafe_fp_loads %(AdditionalOptions)</AdditionalOptions>
@@ -180,12 +183,13 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_WIN64;_CRT_SECURE_NO_WARNINGS;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_WIN64;_CRT_SECURE_NO_WARNINGS;_WINDOWS;_USRDLL;MONGO_HAVE_STDINT;MONGO_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <AdditionalIncludeDirectories>.\libyara\include;.\bson;.\distorm\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ControlFlowGuard>false</ControlFlowGuard>
       <EnablePREfast>false</EnablePREfast>
     </ClCompile>
     <Link>
@@ -193,7 +197,7 @@
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>libyara64.lib;bson.lib;crypt32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libyara64.lib;bson.lib;crypt32.lib;ws2_32.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(ProjectDir)x64\Release;$(ProjectDir)\libyara\lib</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
@@ -202,6 +206,7 @@
       <SetChecksum>true</SetChecksum>
       <LinkErrorReporting>NoErrorReport</LinkErrorReporting>
       <ModuleDefinitionFile>capemon.def</ModuleDefinitionFile>
+      <DelayLoadDLLs>advapi32.dll;user32.dll;ws2_32.dll;crypt32.dll;shlwapi.dll;ole32.dll;shell32.dll;oleaut32.dll;netapi32.dll;bcrypt.dll</DelayLoadDLLs>
     </Link>
     <PreBuildEvent>
       <Command>
@@ -228,10 +233,9 @@
     <ClCompile Include="CAPE\Scylla\ProcessAccessHelp.cpp" />
     <ClCompile Include="CAPE\Scylla\StringConversion.cpp" />
     <ClCompile Include="CAPE\Scylla\SystemInformation.cpp" />
+    <ClCompile Include="CAPE\Solo.c" />
     <ClCompile Include="CAPE\Trace.c" />
     <ClCompile Include="CAPE\Unpacker.c" />
-    <ClCompile Include="CAPE\w64wow64\w64wow64.c" />
-    <ClCompile Include="CAPE\wow64_fix.c" />
     <ClCompile Include="CAPE\YaraHarness.c" />
     <ClCompile Include="config.c" />
     <ClCompile Include="capemon.c" />
@@ -249,6 +253,7 @@
     <ClCompile Include="hooking_64.c" />
     <ClCompile Include="hooks.c" />
     <ClCompile Include="hook_clr.c" />
+    <ClCompile Include="hook_com.c" />
     <ClCompile Include="hook_crypto.c" />
     <ClCompile Include="hook_file.c" />
     <ClCompile Include="hook_lang.c" />
@@ -261,11 +266,13 @@
     <ClCompile Include="hook_sleep.c" />
     <ClCompile Include="hook_socket.c" />
     <ClCompile Include="hook_special.c" />
+    <ClCompile Include="hook_trace.c" />
     <ClCompile Include="hook_sync.c" />
     <ClCompile Include="hook_thread.c" />
     <ClCompile Include="hook_tls.c" />
     <ClCompile Include="hook_vbscript.c" />
     <ClCompile Include="hook_window.c" />
+    <ClCompile Include="hook_wmi.c" />
     <ClCompile Include="ignore.c" />
     <ClCompile Include="log.c" />
     <ClCompile Include="lookup.c" />
@@ -445,6 +452,7 @@
     <ClInclude Include="CAPE\Scylla\SystemInformation.h" />
     <ClInclude Include="CAPE\Scylla\Thunks.h" />
     <ClInclude Include="CAPE\Unpacker.h" />
+    <ClInclude Include="CAPE\uthash.h" />
     <ClInclude Include="CAPE\w64wow64\internal.h" />
     <ClInclude Include="CAPE\w64wow64\w64wow64.h" />
     <ClInclude Include="CAPE\w64wow64\w64wow64defs.h" />
@@ -465,6 +473,7 @@
     <ClInclude Include="hooks.h" />
     <ClInclude Include="hook_file.h" />
     <ClInclude Include="hook_sleep.h" />
+    <ClInclude Include="hook_trace.h" />
     <ClInclude Include="ignore.h" />
     <ClInclude Include="log.h" />
     <ClInclude Include="lookup.h" />

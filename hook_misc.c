@@ -26,16 +26,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "hook_sleep.h"
 #include "config.h"
 #include "ignore.h"
+#include "powerbase.h"
 #include "CAPE\CAPE.h"
 #include "CAPE\Injection.h"
 #include "CAPE\Debugger.h"
 #include "CAPE\YaraHarness.h"
 
 #define STATUS_BAD_COMPRESSION_BUFFER ((NTSTATUS)0xC0000242L)
-
+#define MAX_CLIPBOARD_BUFFER_OF_INTEREST 256
 extern char *our_process_name;
-extern int path_is_system(const wchar_t *path_w);
-extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 extern void ProcessMessage(DWORD ProcessId, DWORD ThreadId);
 extern const char* GetLanguageName(LANGID langID);
 
@@ -44,8 +43,8 @@ extern BOOL TraceRunning;
 extern BOOL Trace(struct _EXCEPTION_POINTERS* ExceptionInfo);
 
 LPTOP_LEVEL_EXCEPTION_FILTER TopLevelExceptionFilter;
-BOOL PlugXConfigDumped, CompressedPE;
 DWORD ExportAddress;
+
 
 HOOKDEF(HHOOK, WINAPI, SetWindowsHookExA,
 	__in  int idHook,
@@ -115,6 +114,25 @@ HOOKDEF(LPTOP_LEVEL_EXCEPTION_FILTER, WINAPI, SetUnhandledExceptionFilter,
 	return res;
 }
 
+#define ALLOW_UNHANDLED_EXCEPTIONS 1
+
+HOOKDEF(LONG, WINAPI, UnhandledExceptionFilter,
+	__in PEXCEPTION_POINTERS ExceptionInfo
+) {
+	LONG ret;
+	if (ALLOW_UNHANDLED_EXCEPTIONS)
+		ret = Old_UnhandledExceptionFilter(ExceptionInfo);
+	else
+		ret = EXCEPTION_EXECUTE_HANDLER;
+	if (ExceptionInfo && !ExceptionInfo->ExceptionRecord->NumberParameters && (ExceptionInfo->ExceptionRecord->ExceptionCode >= 0x80000000 || g_config.log_exceptions > 1))
+		LOQ_zero("process", "ppp", "ExceptionCode", ExceptionInfo->ExceptionRecord->ExceptionCode, "ExceptionAddress", ExceptionInfo->ExceptionRecord->ExceptionAddress, "ExceptionFlags", ExceptionInfo->ExceptionRecord->ExceptionFlags);
+	else if (ExceptionInfo->ExceptionRecord->NumberParameters == 1 && (ExceptionInfo->ExceptionRecord->ExceptionCode >= 0x80000000 || g_config.log_exceptions > 1))
+		LOQ_zero("process", "pppp", "ExceptionCode", ExceptionInfo->ExceptionRecord->ExceptionCode, "ExceptionAddress", ExceptionInfo->ExceptionRecord->ExceptionAddress, "ExceptionFlags", ExceptionInfo->ExceptionRecord->ExceptionFlags, "ExceptionInformation", ExceptionInfo->ExceptionRecord->ExceptionInformation[0]);
+	else if (ExceptionInfo->ExceptionRecord->NumberParameters == 2 && (ExceptionInfo->ExceptionRecord->ExceptionCode >= 0x80000000 || g_config.log_exceptions > 1))
+		LOQ_zero("process", "ppppp", "ExceptionCode", ExceptionInfo->ExceptionRecord->ExceptionCode, "ExceptionAddress", ExceptionInfo->ExceptionRecord->ExceptionAddress, "ExceptionFlags", ExceptionInfo->ExceptionRecord->ExceptionFlags, "ExceptionInformation[0]", ExceptionInfo->ExceptionRecord->ExceptionInformation[0], "ExceptionInformation[1]", ExceptionInfo->ExceptionRecord->ExceptionInformation[1]);
+	return ret;
+}
+
 PVECTORED_EXCEPTION_HANDLER SampleVectoredHandler;
 
 LONG WINAPI New_VectoredExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
@@ -167,6 +185,18 @@ HOOKDEF(PVOID, WINAPI, RtlAddVectoredExceptionHandler,
 	return ret;
 }
 
+HOOKDEF(ULONG, WINAPI, RtlRemoveVectoredExceptionHandler,
+	__in	PVOID Handle
+) {
+	ULONG ret = 0;
+
+	ret = Old_RtlRemoveVectoredExceptionHandler(Handle);
+
+	LOQ_bool("hooking", "p", "Handle", Handle);
+
+	return ret;
+}
+
 HOOKDEF(UINT, WINAPI, SetErrorMode,
 	_In_ UINT uMode
 ) {
@@ -192,6 +222,21 @@ HOOKDEF(NTSTATUS, WINAPI, LdrGetDllHandle,
 	return ret;
 }
 
+HOOKDEF(NTSTATUS, WINAPI, LdrGetDllHandleEx,
+	__in ULONG Flags,
+	__in_opt PWSTR DllPath,
+	__in PULONG DllCharacteristics,
+	__in PUNICODE_STRING DllName,
+	__out_opt PVOID *DllHandle
+) {
+	NTSTATUS ret = Old_LdrGetDllHandleEx(Flags, DllPath, DllCharacteristics, DllName, DllHandle);
+	if (DllHandle)
+		LOQ_ntstatus("system", "oP", "DllName", DllName, "DllHandle", DllHandle);
+	else
+		LOQ_ntstatus("system", "o", "DllName", DllName);
+	return ret;
+}
+
 HOOKDEF(NTSTATUS, WINAPI, LdrGetProcedureAddress,
 	__in		HMODULE ModuleHandle,
 	__in_opt	PANSI_STRING FunctionName,
@@ -214,7 +259,7 @@ HOOKDEF(NTSTATUS, WINAPI, LdrGetProcedureAddress,
 		"FunctionName", FunctionName != NULL ? FunctionName->Length : 0, FunctionName != NULL ? FunctionName->Buffer : NULL,
 		"Ordinal", Ordinal, "FunctionAddress", FunctionAddress);
 
-	if (hook_info()->main_caller_retaddr && g_config.first_process && FunctionName != NULL && (ret == 0xc000007a || ret == 0xc0000139) && FunctionName->Length == 7 &&
+	if (hook_info()->main_caller_retaddr && g_config.first_process && FunctionName != NULL && FunctionName->Buffer != NULL && (ret == 0xc000007a || ret == 0xc0000139) && FunctionName->Length == 7 &&
 		!strncmp(FunctionName->Buffer, "DllMain", 7) && wcsicmp(our_process_path_w, g_config.file_of_interest)) {
 		log_flush();
 		ExitThread(0);
@@ -247,7 +292,7 @@ HOOKDEF(NTSTATUS, WINAPI, LdrGetProcedureAddressForCaller,
 		"FunctionName", FunctionName != NULL ? FunctionName->Length : 0, FunctionName != NULL ? FunctionName->Buffer : NULL,
 		"Ordinal", Ordinal, "FunctionAddress", FunctionAddress);
 
-	if (hook_info()->main_caller_retaddr && g_config.first_process && FunctionName != NULL && (ret == 0xc000007a || ret == 0xc0000139) && FunctionName->Length == 7 &&
+	if (hook_info()->main_caller_retaddr && g_config.first_process && FunctionName != NULL && FunctionName->Buffer != NULL && (ret == 0xc000007a || ret == 0xc0000139) && FunctionName->Length == 7 &&
 		!strncmp(FunctionName->Buffer, "DllMain", 7) && wcsicmp(our_process_path_w, g_config.file_of_interest)) {
 		log_flush();
 		ExitThread(0);
@@ -527,6 +572,13 @@ HOOKDEF(int, WINAPI, GetSystemMetrics,
 ) {
 	int ret = Old_GetSystemMetrics(nIndex);
 
+	if (!g_config.no_stealth) {
+		if (nIndex == SM_CXSCREEN || nIndex == SM_CXVIRTUALSCREEN)
+			ret = 1920;
+		else if (nIndex == SM_CYSCREEN || nIndex == SM_CYVIRTUALSCREEN)
+			ret = 1080;
+	}
+
 	if (nIndex == SM_CXSCREEN || nIndex == SM_CXVIRTUALSCREEN || nIndex == SM_CYSCREEN ||
 		nIndex == SM_CYVIRTUALSCREEN || nIndex == SM_REMOTECONTROL || nIndex == SM_REMOTESESSION ||
 		nIndex == SM_SHUTTINGDOWN || nIndex == SM_SWAPBUTTON)
@@ -639,7 +691,7 @@ HOOKDEF(BOOL, WINAPI, GetComputerNameExW,
 	if (nSize && *nSize)
 		bufsize = *nSize;
 	BOOL ret = Old_GetComputerNameExW(NameType, lpBuffer, nSize);
-	if (ret && nSize && !*nSize && NameType < ComputerNameMax && wcslen(ComputerNames[NameType]) < bufsize) {
+	if (!g_config.no_stealth && ret && nSize && !*nSize && NameType >= 0 && NameType < ComputerNameMax && wcslen(ComputerNames[NameType]) < bufsize) {
 		bufsize = (DWORD)wcslen(ComputerNames[NameType]);
 		wcsncpy(lpBuffer, ComputerNames[NameType], bufsize + 1);
 		*nSize = bufsize;
@@ -708,30 +760,14 @@ HOOKDEF(NTSTATUS, WINAPI, RtlDecompressBuffer,
 		*FinalUncompressedSize, UncompressedBuffer, "UncompressedBufferLength", *FinalUncompressedSize);
 
 	if ((NT_SUCCESS(ret) || ret == STATUS_BAD_COMPRESSION_BUFFER) && (*FinalUncompressedSize > 0)) {
-		if (g_config.unpacker || g_config.plugx) {
-			DebugOutput("RtlDecompressBuffer hook: scanning region 0x%x size 0x%x.\n", UncompressedBuffer, *FinalUncompressedSize);
+		if (g_config.unpacker) {
+			DebugOutput("RtlDecompressBuffer hook: scanning region 0x%p size 0x%x.\n", UncompressedBuffer, *FinalUncompressedSize);
 			if (g_config.yarascan)
 				YaraScan(UncompressedBuffer, *FinalUncompressedSize);
-			if (*(WORD*)UncompressedBuffer == PLUGX_SIGNATURE) {
-                DebugOutput("PlugX header - correcting");
-				PBYTE PEImage = (BYTE*)malloc(*FinalUncompressedSize);
-				if (PEImage) {
-					g_config.plugx = 1;
-					memcpy(PEImage, UncompressedBuffer, *FinalUncompressedSize);
-					*(WORD*)PEImage = IMAGE_DOS_SIGNATURE;
-					LONG e_lfanew = *(LONG*)(PEImage + FIELD_OFFSET(IMAGE_DOS_HEADER, e_lfanew));
-					if (*(DWORD*)(PEImage + e_lfanew) == PLUGX_SIGNATURE)
-						*(DWORD*)(PEImage + e_lfanew) = IMAGE_NT_SIGNATURE;
-					CapeMetaData->TypeString = "PlugX Payload";
-					DumpPEsInRange(PEImage, *FinalUncompressedSize);
-					free(PEImage);
-				}
-			}
-			else if (g_config.plugx)
-				CapeMetaData->TypeString = "PlugX Payload";
-			else
-				CapeMetaData->DumpType = COMPRESSION;
-			CompressedPE = DumpPEsInRange(UncompressedBuffer, *FinalUncompressedSize);
+			CapeMetaData->DumpType = COMPRESSION;
+			DumpPEsInRange(UncompressedBuffer, *FinalUncompressedSize);
+			CapeMetaData->DumpType = UNPACKED_SHELLCODE;
+			DumpMemory(UncompressedBuffer, *FinalUncompressedSize);
 		}
 	}
 
@@ -765,8 +801,8 @@ HOOKDEF(void, WINAPI, GetSystemInfo,
 
 	Old_GetSystemInfo(lpSystemInfo);
 
-	if (!g_config.no_stealth && lpSystemInfo->dwNumberOfProcessors < 4)
-		lpSystemInfo->dwNumberOfProcessors = 4;
+	if (!g_config.no_stealth && lpSystemInfo->dwNumberOfProcessors < g_config.spoofed_cpu_count)
+		lpSystemInfo->dwNumberOfProcessors = g_config.spoofed_cpu_count;
 
 	LOQ_void("misc", "");
 
@@ -817,9 +853,19 @@ normal_call:
 		ret = Old_NtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
 		LOQ_ntstatus("misc", "i", "SystemInformationClass", SystemInformationClass);
 
+		if (!g_config.no_stealth && SystemInformationClass == SystemHypervisorDetailInformation) {
+			if (SystemInformation && SystemInformationLength > 0) {
+				memset(SystemInformation, 0, SystemInformationLength);
+			}
+			if (ReturnLength) {
+				*ReturnLength = 0;
+			}
+			return 0xC0000003L; // STATUS_INVALID_INFO_CLASS
+		}
+
 		if (!g_config.no_stealth && SystemInformationClass == SystemBasicInformation && SystemInformationLength >= sizeof(SYSTEM_BASIC_INFORMATION) && NT_SUCCESS(ret)) {
 			PSYSTEM_BASIC_INFORMATION p = (PSYSTEM_BASIC_INFORMATION)SystemInformation;
-			p->NumberOfProcessors = 4;
+			p->NumberOfProcessors = g_config.spoofed_cpu_count;
 		}
 
 		/* This is nearly arbitrary and simply designed to test whether the Upatre author(s) or others
@@ -928,8 +974,7 @@ HOOKDEF(HDEVINFO, WINAPI, SetupDiGetClassDevsA,
 
 	if (ClassGuid) {
 		memcpy(&id1, ClassGuid, sizeof(id1));
-		sprintf(idbuf, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", id1.Data1, id1.Data2, id1.Data3,
-			id1.Data4[0], id1.Data4[1], id1.Data4[2], id1.Data4[3], id1.Data4[4], id1.Data4[5], id1.Data4[6], id1.Data4[7]);
+		uuid_to_string(id1, idbuf);
 
 		if ((known = known_object(&id1)))
 			LOQ_handle("misc", "ss", "ClassGuid", idbuf, "Known", known);
@@ -957,8 +1002,7 @@ HOOKDEF(HDEVINFO, WINAPI, SetupDiGetClassDevsW,
 	HDEVINFO ret = Old_SetupDiGetClassDevsW(ClassGuid, Enumerator, hwndParent, Flags);
 	if (ClassGuid) {
 		memcpy(&id1, ClassGuid, sizeof(id1));
-		sprintf(idbuf, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", id1.Data1, id1.Data2, id1.Data3,
-			id1.Data4[0], id1.Data4[1], id1.Data4[2], id1.Data4[3], id1.Data4[4], id1.Data4[5], id1.Data4[6], id1.Data4[7]);
+		uuid_to_string(id1, idbuf);
 
 		if ((known = known_object(&id1)))
 			LOQ_handle("misc", "ss", "ClassGuid", idbuf, "Known", known);
@@ -1169,8 +1213,8 @@ HOOKDEF(void, WINAPI, GlobalMemoryStatus,
 ) {
 	BOOL ret = TRUE;
 	Old_GlobalMemoryStatus(lpBuffer);
-	if (!g_config.no_stealth && lpBuffer->dwTotalPhys < 0x400000000)
-		lpBuffer->dwTotalPhys = (SIZE_T)0x400000000;
+	if (!g_config.no_stealth && lpBuffer->dwTotalPhys < SPOOFED_RAM)
+		lpBuffer->dwTotalPhys = (SIZE_T)SPOOFED_RAM;
 	LOQ_void("misc", "ii", "MemoryLoad", lpBuffer->dwMemoryLoad, "TotalPhysicalMB", lpBuffer->dwTotalPhys / (1024 * 1024));
 }
 
@@ -1178,9 +1222,19 @@ HOOKDEF(BOOL, WINAPI, GlobalMemoryStatusEx,
 	_Out_ LPMEMORYSTATUSEX lpBuffer
 ) {
 	BOOL ret = Old_GlobalMemoryStatusEx(lpBuffer);
-	if (ret && !g_config.no_stealth && lpBuffer->ullTotalPhys < 0x400000000)
-		lpBuffer->ullTotalPhys = 0x400000000;
+	if (ret && !g_config.no_stealth && lpBuffer->ullTotalPhys < SPOOFED_RAM)
+		lpBuffer->ullTotalPhys = SPOOFED_RAM;
 	LOQ_void("misc", "ii", "MemoryLoad", lpBuffer->dwMemoryLoad, "TotalPhysicalMB", lpBuffer->ullTotalPhys / (1024 * 1024));
+	return ret;
+}
+
+HOOKDEF(BOOL, WINAPI, GetPhysicallyInstalledSystemMemory,
+	_Out_ PULONGLONG TotalMemoryInKilobytes
+) {
+	BOOL ret = Old_GetPhysicallyInstalledSystemMemory(TotalMemoryInKilobytes);
+	if (ret && !g_config.no_stealth && (*TotalMemoryInKilobytes * 1024) < SPOOFED_RAM)
+		*TotalMemoryInKilobytes = SPOOFED_RAM / 1024;
+	LOQ_void("misc", "i", "TotalMemoryInKilobytes", *TotalMemoryInKilobytes);
 	return ret;
 }
 
@@ -1223,42 +1277,6 @@ HOOKDEF(HRESULT, WINAPI, PStoreCreateInstance,
 	HRESULT ret = Old_PStoreCreateInstance(ppProvider, pProviderID, pReserved, dwFlags);
 	LOQ_hresult("misc", "");
 	return ret;
-}
-
-HOOKDEF(void, WINAPIV, memcpy,
-   void *dest,
-   const void *src,
-   size_t count
-)
-{
-	Old_memcpy(dest, src, count);
-
-	if ((g_config.plugx || CompressedPE) && !PlugXConfigDumped &&
-	(
-		count == 0xae4  ||	// 2788
-		count == 0xbe4  ||	// 3044
-		count == 0x150c ||	// 5388
-		count == 0x1510 ||	// 5392
-		count == 0x1516 ||	// 5398
-		count == 0x170c ||	// 5900
-		count == 0x1b18 ||	// 6936
-		count == 0x1d18 ||	// 7448
-		count == 0x2540 ||	// 9536
-		count == 0x254c ||	// 9668
-		count == 0x2d58 ||	// 11608
-		count == 0x36a4 ||	// 13988
-		count == 0x4ea4		// 20132
-		//count > 0xa00 &&	//fuzzy matching (2560)
-		//count < 0x5000	//fuzzy matching (20480)
-	))
-	{
-		DebugOutput("PlugX config detected (size 0x%d), dumping.\n", count);
-		CapeMetaData->TypeString = "PlugX Config";
-		DumpMemoryRaw((BYTE*)src, count);
-		PlugXConfigDumped = TRUE;
-	}
-
-	return;
 }
 
 HOOKDEF(void, WINAPIV, srand,
@@ -1808,40 +1826,10 @@ HOOKDEF(NTSTATUS, WINAPI, NtQueryLicenseValue,
 ) {
 	WCHAR VMDetection[] = L"Kernel-VMDetection-Private";
 	NTSTATUS ret = Old_NtQueryLicenseValue(Name, Type, Buffer, Length, DataLength);
-	if (NT_SUCCESS(ret) && Buffer && !wcsncmp(Name->Buffer, VMDetection, Name->Length))
+	if (!g_config.no_stealth && NT_SUCCESS(ret) && Buffer && Name && Name->Buffer && Name->Length == sizeof(VMDetection) - sizeof(WCHAR) && !wcsncmp(Name->Buffer, VMDetection, Name->Length / sizeof(WCHAR)))
 		*(PBOOL)Buffer = FALSE;
 	LOQ_ntstatus("system", "oP", "Name", Name, "Type", Type);
 	return ret;
-}
-
-HOOKDEF(int, WINAPI, MultiByteToWideChar,
-	__in		UINT	CodePage,
-	__in		DWORD	dwFlags,
-	__in		LPCCH	lpMultiByteStr,
-	__in		int		cbMultiByte,
-	__out_opt	LPWSTR	lpWideCharStr,
-	__in		int		cchWideChar
-) {
-	DWORD ret = 0;
-	if (CodePage == CP_ACP || CodePage == CP_UTF8)
-		LOQ_zero("misc", "s", "String", lpMultiByteStr);
-	return Old_MultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
-}
-
-HOOKDEF(int, WINAPI, WideCharToMultiByte,
-	__in		UINT	CodePage,
-	__in		DWORD	dwFlags,
-	__in		LPCWCH	lpWideCharStr,
-	__in		int		cchWideChar,
-	__out_opt	LPSTR	lpMultiByteStr,
-	__in		int		cbMultiByte,
-	__in_opt	LPCCH	lpDefaultChar,
-	__out_opt	LPBOOL	lpUsedDefaultChar
-) {
-	DWORD ret = 0;
-	if (CodePage == CP_ACP || CodePage == CP_UTF8)
-		LOQ_zero("misc", "u", "String", lpWideCharStr);
-	return Old_WideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
 }
 
 HOOKDEF(LPSTR, WINAPI, GetCommandLineA,
@@ -1857,6 +1845,15 @@ HOOKDEF(LPWSTR, WINAPI, GetCommandLineW,
 ) {
 	LPWSTR ret = Old_GetCommandLineW();
 	LOQ_nonnull("misc", "u", "CommandLine", ret);
+	return ret;
+}
+
+HOOKDEF(LPWSTR, WINAPI, CommandLineToArgvW,
+	__in LPWSTR lpCmdLine,
+	__out int *pNumArgs
+) {
+	LPWSTR ret = Old_CommandLineToArgvW(lpCmdLine, pNumArgs);
+	LOQ_nonnull("misc", "ui", "CommandLine", lpCmdLine, "NumArgs", *pNumArgs);
 	return ret;
 }
 
@@ -1878,10 +1875,12 @@ HOOKDEF(BOOL, WINAPI, EnumDisplayDevicesA,
 	const char replacement[] = "NVIDIA GeForce RTX 3060";
 
 	BOOL ret = Old_EnumDisplayDevicesA(lpDevice, iDevNum, lpDisplayDevice, dwFlags);
-	for (int i = 0; i < keywords_size; i++) {
-		if (stristr(lpDisplayDevice->DeviceString, keywords[i]) != NULL) {
-			snprintf(lpDisplayDevice->DeviceString, strlen(replacement) + 1, replacement);
-			break;
+	if (!g_config.no_stealth && ret && lpDisplayDevice) {
+		for (int i = 0; i < keywords_size; i++) {
+			if (stristr(lpDisplayDevice->DeviceString, keywords[i]) != NULL) {
+				snprintf(lpDisplayDevice->DeviceString, strlen(replacement) + 1, replacement);
+				break;
+			}
 		}
 	}
 	LOQ_bool("misc", "s", "DeviceString", lpDisplayDevice->DeviceString);
@@ -1906,12 +1905,283 @@ HOOKDEF(BOOL, WINAPI, EnumDisplayDevicesW,
 	const wchar_t replacement[] = L"NVIDIA GeForce RTX 3060";
 
 	BOOL ret = Old_EnumDisplayDevicesW(lpDevice, iDevNum, lpDisplayDevice, dwFlags);
-	for (int i = 0; i < keywords_size; i++) {
-		if (wcsistr(lpDisplayDevice->DeviceString, keywords[i]) != NULL) {
-			swprintf(lpDisplayDevice->DeviceString, wcslen(replacement) + 1, replacement);
-			break;
+	if (!g_config.no_stealth && ret && lpDisplayDevice) {
+		for (int i = 0; i < keywords_size; i++) {
+			if (wcsistr(lpDisplayDevice->DeviceString, keywords[i]) != NULL) {
+				swprintf(lpDisplayDevice->DeviceString, wcslen(replacement) + 1, replacement);
+				break;
+			}
 		}
 	}
 	LOQ_bool("misc", "u", "DeviceString", lpDisplayDevice->DeviceString);
+	return ret;
+}
+
+HOOKDEF(UINT, WINAPI, MsiInstallProductA,
+	_In_	LPCSTR	szPackagePath,
+	_In_	LPCSTR	szCommandLine
+) {
+	UINT ret = Old_MsiInstallProductA(szPackagePath, szCommandLine);
+	LOQ_zero("misc", "ss", "PackagePath", szPackagePath, "CommandLine", szCommandLine);
+	return ret;
+}
+
+HOOKDEF(UINT, WINAPI, MsiInstallProductW,
+	_In_	LPCWSTR	szPackagePath,
+	_In_	LPCWSTR	szCommandLine
+) {
+	UINT ret = Old_MsiInstallProductW(szPackagePath, szCommandLine);
+	LOQ_zero("misc", "uu", "PackagePath", szPackagePath, "CommandLine", szCommandLine);
+	return ret;
+}
+
+HOOKDEF(ULONG, __fastcall, vDbgPrintExWithPrefixInternal,
+	__in  PCH Prefix,
+	__in  ULONG ComponentId,
+	__in  ULONG Level,
+	__in  PCHAR Format,
+	__in  va_list arglist,
+	__in  BOOLEAN HandleBreakpoint
+) {
+	UCHAR Buffer[512];
+	size_t cb = strlen(Prefix);
+	strcpy(Buffer, Prefix);
+	cb = _vsnprintf(Buffer + cb, sizeof(Buffer) - cb, Format, arglist) + cb;
+
+	if (cb == -1) {
+		cb = sizeof(Buffer);
+		Buffer[sizeof(Buffer) - 1] = '\n';
+	}
+
+	DebugOutput("%s", Buffer);
+
+	return Old_vDbgPrintExWithPrefixInternal(Prefix, ComponentId, Level, Format, arglist, HandleBreakpoint);
+}
+
+HOOKDEF(DWORD, WINAPI, MapFileAndCheckSumA,
+	_In_  PCSTR  Filename,
+	_Out_ PDWORD HeaderSum,
+	_Out_ PDWORD CheckSum
+) {
+	DWORD ret = Old_MapFileAndCheckSumA(Filename, HeaderSum, CheckSum);
+
+	if (HeaderSum && CheckSum)
+		*CheckSum = *HeaderSum;
+
+	if (HeaderSum && CheckSum)
+		LOQ_zero("misc", "fhh", "Filename", Filename, "HeaderSum", *HeaderSum, "CheckSum", *CheckSum);
+	else
+		LOQ_zero("misc", "f", "Filename", Filename);
+
+	return ret;
+}
+
+HOOKDEF(NTSTATUS, WINAPI, NtPowerInformation,
+	__in		POWER_INFORMATION_LEVEL InformationLevel,
+	__in_opt	PVOID				   InputBuffer,
+	__in		ULONG				   InputBufferLength,
+	__out_opt	PVOID				   OutputBuffer,
+	__in		ULONG				   OutputBufferLength
+) {
+	NTSTATUS ret = Old_NtPowerInformation(InformationLevel, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength);
+	if (!g_config.no_stealth && ret == 0 && OutputBuffer && InformationLevel == SystemPowerCapabilities && OutputBufferLength >= sizeof(SYSTEM_POWER_CAPABILITIES)) {
+		// Most VM systems does not support either S0 or S3 sleep, which can be used to detect the presence of a VM.
+		// S0, S4 and S5 being enabled is typical for a normal Modern Standby machine. 
+		SYSTEM_POWER_CAPABILITIES* ptr = (SYSTEM_POWER_CAPABILITIES *)OutputBuffer;
+		ptr->AoAc = 1;
+		ptr->SystemS4 = 1;
+		ptr->SystemS5 = 1;
+		ptr->ThermalControl = 1;
+	}
+	LOQ_ntstatus("device", "ibb",
+		"InformationLevel", InformationLevel,
+		"InputBuffer", InputBufferLength, InputBuffer,
+		"OutputBuffer", OutputBufferLength, OutputBuffer);
+	return ret;
+}
+
+HOOKDEF(BOOL, WINAPI, OpenClipboard,
+	_In_opt_ HWND hWndNewOwner
+){
+	BOOL ret = Old_OpenClipboard(hWndNewOwner);
+	LOQ_bool("misc", ""); 
+	return ret;
+}
+
+HOOKDEF(HANDLE, WINAPI, GetClipboardData,
+	_In_ UINT uFormat
+){
+	HANDLE ret = Old_GetClipboardData(uFormat);
+	if (ret == NULL)
+		return ret;
+
+	if (uFormat == CF_UNICODETEXT) {
+		LPWSTR clip_buff = (LPWSTR)GlobalLock(ret);
+		if (clip_buff == NULL)
+			return ret;
+		size_t textLen = wcsnlen(clip_buff, MAX_CLIPBOARD_BUFFER_OF_INTEREST) + 1;
+		LPWSTR local_buff = (LPWSTR)malloc(textLen * sizeof(WCHAR));
+		if (local_buff) {
+			wcsncpy_s(local_buff, textLen, clip_buff, _TRUNCATE);
+			GlobalUnlock(ret);
+			LOQ_handle("misc", "iu", "Format", uFormat, "Data", local_buff);
+			free(local_buff);
+		} else {
+			GlobalUnlock(ret);
+		}
+	} else if (uFormat == CF_TEXT || uFormat == CF_OEMTEXT) {
+		char* clip_buff = (char*)GlobalLock(ret);
+		if (clip_buff == NULL)
+			return ret;
+		size_t textLen = strnlen(clip_buff, MAX_CLIPBOARD_BUFFER_OF_INTEREST) + 1;
+		char* local_buff = (char*)malloc(textLen * sizeof(char));
+		if (local_buff) {
+			strncpy_s(local_buff, textLen, clip_buff, _TRUNCATE);
+			GlobalUnlock(ret);
+			if (uFormat == CF_TEXT) {
+				LOQ_handle("misc", "is", "Format", uFormat, "Data", local_buff);
+			} else {
+				char conv_buff[MAX_CLIPBOARD_BUFFER_OF_INTEREST];
+				OemToCharBuffA(local_buff, conv_buff, (DWORD)MAX_CLIPBOARD_BUFFER_OF_INTEREST);
+				LOQ_handle("misc", "is", "Format", uFormat, "Data", conv_buff);
+			}
+			free(local_buff);
+		} else {
+			GlobalUnlock(ret);
+		}
+	} else {
+		LOQ_handle("misc", "i", "Format", uFormat);
+	}
+	return ret;
+}
+
+HOOKDEF(HANDLE, WINAPI, SetClipboardData,
+	_In_	 UINT   uFormat,
+	_In_opt_ HANDLE hMem
+){
+	// Log what the malware is writing before the call, since the system
+	// takes ownership of hMem after SetClipboardData succeeds.
+	if (hMem != NULL) {
+		if (uFormat == CF_UNICODETEXT) {
+			LPWSTR clip_buff = (LPWSTR)GlobalLock(hMem);
+			if (clip_buff != NULL) {
+				size_t textLen = wcsnlen(clip_buff, MAX_CLIPBOARD_BUFFER_OF_INTEREST) + 1;
+				LPWSTR local_buff = (LPWSTR)malloc(textLen * sizeof(WCHAR));
+				if (local_buff) {
+					wcsncpy_s(local_buff, textLen, clip_buff, _TRUNCATE);
+					GlobalUnlock(hMem);
+					HANDLE ret = Old_SetClipboardData(uFormat, hMem);
+					LOQ_handle("misc", "iu", "Format", uFormat, "Data", local_buff);
+					free(local_buff);
+					return ret;
+				}
+				GlobalUnlock(hMem);
+			}
+		} else if (uFormat == CF_TEXT || uFormat == CF_OEMTEXT) {
+			char* clip_buff = (char*)GlobalLock(hMem);
+			if (clip_buff != NULL) {
+				size_t textLen = strnlen(clip_buff, MAX_CLIPBOARD_BUFFER_OF_INTEREST) + 1;
+				char* local_buff = (char*)malloc(textLen * sizeof(char));
+				if (local_buff) {
+					strncpy_s(local_buff, textLen, clip_buff, _TRUNCATE);
+					GlobalUnlock(hMem);
+					HANDLE ret = Old_SetClipboardData(uFormat, hMem);
+					if (uFormat == CF_TEXT) {
+						LOQ_handle("misc", "is", "Format", uFormat, "Data", local_buff);
+					} else {
+						char conv_buff[MAX_CLIPBOARD_BUFFER_OF_INTEREST];
+						OemToCharBuffA(local_buff, conv_buff, (DWORD)MAX_CLIPBOARD_BUFFER_OF_INTEREST);
+						LOQ_handle("misc", "is", "Format", uFormat, "Data", conv_buff);
+					}
+					free(local_buff);
+					return ret;
+				}
+				GlobalUnlock(hMem);
+			}
+		}
+	}
+
+	HANDLE ret = Old_SetClipboardData(uFormat, hMem);
+	if (ret == NULL)
+		return ret;
+	LOQ_handle("misc", "i", "Format", uFormat);
+	return ret;
+}
+
+static void OverwriteMemoryPattern(PBYTE buf, DWORD size, const char* pPattern, const char* pReplace) {
+	if (!buf || size == 0 || !pPattern || !pReplace) return;
+	size_t patLen = strlen(pPattern);
+	size_t repLen = strlen(pReplace);
+	if (patLen != repLen || patLen == 0) return;
+
+	for (DWORD i = 0; i <= size - patLen; i++) {
+		if (memcmp(&buf[i], pPattern, patLen) == 0) {
+			memcpy(&buf[i], pReplace, patLen);
+		}
+	}
+}
+
+HOOKDEF(UINT, WINAPI, EnumSystemFirmwareTables,
+	_In_  DWORD FirmwareTableProviderSignature,
+	_Out_ PVOID FirmwareTableBuffer,
+	_In_  DWORD BufferSize
+) {
+	UINT ret = Old_EnumSystemFirmwareTables(FirmwareTableProviderSignature, FirmwareTableBuffer, BufferSize);
+	LOQ_void("misc", "");
+
+	// Filter out WAET (Windows ACPI Emulated devices Table) from ACPI signatures list
+	if (ret > 0 && FirmwareTableProviderSignature == 0x41435049 && FirmwareTableBuffer && BufferSize >= ret) {
+		PDWORD pSigs = (PDWORD)FirmwareTableBuffer;
+		UINT count = ret / sizeof(DWORD);
+		UINT write_idx = 0;
+		for (UINT i = 0; i < count; i++) {
+			if (pSigs[i] == 0x54454157) { // 'WAET' in little-endian representation
+				continue; // Skip WAET signature completely
+			}
+			pSigs[write_idx++] = pSigs[i];
+		}
+		ret = write_idx * sizeof(DWORD);
+	}
+	return ret;
+}
+
+HOOKDEF(UINT, WINAPI, GetSystemFirmwareTable,
+	_In_  DWORD FirmwareTableProviderSignature,
+	_In_  DWORD FirmwareTableID,
+	_Out_ PVOID FirmwareTableBuffer,
+	_In_  DWORD BufferSize
+) {
+	// If queried for WAET, return 0 (table not found)
+	if (FirmwareTableProviderSignature == 0x41435049 && FirmwareTableID == 0x54454157) {
+		return 0;
+	}
+
+	UINT ret = Old_GetSystemFirmwareTable(FirmwareTableProviderSignature, FirmwareTableID, FirmwareTableBuffer, BufferSize);
+	LOQ_void("misc", "");
+
+	if (ret > 0 && FirmwareTableBuffer && BufferSize >= ret) {
+		PBYTE buf = (PBYTE)FirmwareTableBuffer;
+		if (FirmwareTableProviderSignature == 0x41435049) { // ACPI
+			OverwriteMemoryPattern(buf, ret, "VBOX__", "INTEL_");
+			OverwriteMemoryPattern(buf, ret, "VMWARE", "INTEL_");
+			OverwriteMemoryPattern(buf, ret, "QEMU__", "INTEL_");
+			OverwriteMemoryPattern(buf, ret, "BOCHS_", "INTEL_");
+			OverwriteMemoryPattern(buf, ret, "vbox__", "intel_");
+			OverwriteMemoryPattern(buf, ret, "vmware", "intel_");
+			OverwriteMemoryPattern(buf, ret, "qemu__", "intel_");
+			OverwriteMemoryPattern(buf, ret, "bochs_", "intel_");
+		}
+		else if (FirmwareTableProviderSignature == 0x52534D42) { // RSMB (Raw SMBIOS)
+			OverwriteMemoryPattern(buf, ret, "VMware", "Intel ");
+			OverwriteMemoryPattern(buf, ret, "VirtualBox", "Intel Corp");
+			OverwriteMemoryPattern(buf, ret, "Hyper-V", "Samsung");
+			OverwriteMemoryPattern(buf, ret, "QEMU", "ASUS");
+			OverwriteMemoryPattern(buf, ret, "Bochs", "Intel");
+			OverwriteMemoryPattern(buf, ret, "vbox", "asus");
+			OverwriteMemoryPattern(buf, ret, "vmware", "intel ");
+			OverwriteMemoryPattern(buf, ret, "qemu", "asus");
+			OverwriteMemoryPattern(buf, ret, "bochs", "intel");
+		}
+	}
 	return ret;
 }

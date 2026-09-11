@@ -703,27 +703,27 @@ int hook_api(hook_t *h, int type)
 				addr = (unsigned char *)get_vbscript_addr(hmod, (PCHAR)h->funcname);
 		}
 		else {
-			PVOID exportaddr = GetFunctionAddress(hmod, (PCHAR)h->funcname);
 			addr = (unsigned char *)GetProcAddress(hmod, h->funcname);
+			PVOID exportaddr = GetFunctionAddress(hmod, (PCHAR)h->funcname);
 			if (exportaddr && addr && (PVOID)addr != exportaddr) {
-				unsigned int offset;
-				char *module_name = convert_address_to_dll_name_and_offset((ULONG_PTR)addr, &offset);
-				DebugOutput("hook_api: Warning - %s export address 0x%p differs from GetProcAddress -> 0x%p (%s::0x%x)\n", h->funcname, exportaddr, addr, module_name, offset);
+				unsigned int offset = (unsigned int)((ULONG_PTR)addr - (ULONG_PTR)hmod);
+				UNICODE_STRING *module_name = get_module_name((ULONG_PTR)addr);
+				DebugOutput("hook_api: Warning - %s export address 0x%p differs from GetProcAddress -> 0x%p (%wZ::0x%x)\n", h->funcname, exportaddr, addr, module_name, offset);
 			}
 			else if (exportaddr && !addr) {
 				addr = exportaddr;
 				if  (!wcscmp(h->library, L"clrjit"))
 					DebugOutput("hook_api: clrjit::%s export address 0x%p obtained via GetFunctionAddress\n", h->funcname, addr);
-				else
-					DebugOutput("hook_api: %s export address 0x%p obtained via GetFunctionAddress\n", h->funcname, addr);
 			}
 		}
+	}
 
-		if (addr == NULL && h->timestamp != 0 && h->rva != 0) {
-			DWORD timestamp = GetTimeStamp(hmod);
-			if (timestamp == h->timestamp)
-				addr = (unsigned char *)hmod + h->rva;
-		}
+	if (addr == NULL && h->timestamp != 0 && h->rva != 0) {
+		if (!hmod)
+			hmod = GetModuleHandleW(h->library);
+		DWORD timestamp = GetTimeStamp(hmod);
+		if (timestamp == h->timestamp)
+			addr = (unsigned char *)hmod + h->rva;
 	}
 
 	if (addr == NULL || addr == (unsigned char *)0xffbadd11) {
@@ -836,51 +836,48 @@ int hook_api(hook_t *h, int type)
 		type = HOOK_JMP_DIRECT;
 
 	// make the address writable
-	if (VirtualProtect(addr - hook_types[type].offset, hook_types[type].offset + hook_types[type].len, PAGE_EXECUTE_READWRITE, &old_protect)) {
-
-		h->hookdata = alloc_hookdata_near(addr);
-
-		if (h->hookdata && hook_create_trampoline(addr, hook_types[type].len, h->hookdata->tramp)) {
-			//hook_store_exception_info(h);
-			uint8_t orig[16];
-			memcpy(orig, addr, 16);
-
-			if (h->notail)
-				hook_create_pre_tramp_notail(h);
-			else
-				hook_create_pre_tramp(h);
-
-			// insert the hook (jump from the api to the
-			// pre-trampoline)
-			ret = hook_types[type].hook(h, addr, h->hookdata->pre_tramp);
-
-			// Add unhook detection for our newly created hook.
-			// Ensure any changes behind our hook are also caught by
-			// making the buffersize 16.
-			unhook_detect_add_region(h, addr - hook_types[type].offset, orig, addr - hook_types[type].offset, 16);
-
-			// if successful, assign the trampoline address to *old_func
-			if (ret == 0) {
-				// This will be NULL in cases where we don't care to call the original function from our hook (NOTAIL)
-				if (h->old_func)
-					*h->old_func = h->hookdata->tramp;
-
-				// hook is successful
-				h->is_hooked = 1;
-				h->hook_addr = addr;
-				add_dll_range((ULONG_PTR)hmod, (ULONG_PTR)hmod + GetAllocationSize(hmod));
-			}
-		}
-		else {
-			pipe("WARNING:Unable to place hook on %z", h->funcname);
-		}
-
-		// restore the old protection
-		VirtualProtect(addr - hook_types[type].offset, hook_types[type].offset + hook_types[type].len, old_protect, &old_protect);
-	}
-	else {
+	if (!VirtualProtect(addr - hook_types[type].offset, hook_types[type].offset + hook_types[type].len, PAGE_EXECUTE_READWRITE, &old_protect)) {
 		pipe("WARNING:Unable to change protection for hook on %z", h->funcname);
+		return 0;
 	}
+
+	h->hookdata = alloc_hookdata_near(addr);
+	if (!h->hookdata) {
+		pipe("WARNING:Unable to allocate hook data for %z, type %d", h->funcname, type);
+		goto restore_protect;
+	}
+
+	if (!hook_create_trampoline(addr, hook_types[type].len, h->hookdata->tramp)) {
+		if (type != HOOK_SAFEST) {
+			VirtualProtect(addr - hook_types[type].offset, hook_types[type].offset + hook_types[type].len, old_protect, &old_protect);
+			DebugOutput("hook_api: Trampoline creation failed for %s, retrying with HOOK_SAFEST\n", h->funcname);
+			return hook_api(h, HOOK_SAFEST);
+		}
+		pipe("WARNING:Unable to create trampoline for %z, hook type %d", h->funcname, type);
+		goto restore_protect;
+	}
+
+	uint8_t orig[16];
+	memcpy(orig, addr, 16);
+
+	if (h->notail)
+		hook_create_pre_tramp_notail(h);
+	else
+		hook_create_pre_tramp(h);
+
+	ret = hook_types[type].hook(h, addr, h->hookdata->pre_tramp);
+	unhook_detect_add_region(h, addr - hook_types[type].offset, orig, addr - hook_types[type].offset, 16);
+
+	if (ret == 0) {
+		if (h->old_func)
+			*h->old_func = h->hookdata->tramp;
+		h->is_hooked = 1;
+		h->hook_addr = addr;
+		add_dll_range((ULONG_PTR)hmod, (ULONG_PTR)hmod + GetAllocationSize(hmod));
+	}
+
+restore_protect:
+	VirtualProtect(addr - hook_types[type].offset, hook_types[type].offset + hook_types[type].len, old_protect, &old_protect);
 
 	return ret;
 }
@@ -934,7 +931,12 @@ int operate_on_backtrace(ULONG_PTR _esp, ULONG_PTR _ebp, void *extra, int(*func)
 	}
 	__except(EXCEPTION_EXECUTE_HANDLER)
 	{
-		return -1;
+		// If accessing non-standard frames or a garbage EBP (very common with 32-bit Golang 
+		// binaries) causes an exception, we return the already-evaluated 'ret' value (which is 0 
+		// if the immediate caller of the API was verified to be outside Capemon's DLL). This 
+		// prevents the hooking engine from misclassifying the exception as a recursive call (-1), 
+		// successfully enabling logging for 32-bit Go binary API calls.
+		return ret;
 	}
 }
 #endif

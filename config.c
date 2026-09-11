@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "unhook.h"
 #include "Shlwapi.h"
 #include "CAPE\CAPE.h"
+#include "CAPE\Debugger.h"
 
 #define SINGLE_STEP_LIMIT 0x4000  // default unless specified in web ui
 #define DROPPED_LIMIT 100
@@ -40,11 +41,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define PrintEAX		3
 
 extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
+extern void ProcessMessage(DWORD ProcessId, DWORD ThreadId);
 extern char *our_dll_path;
 extern char *our_process_name;
-extern int path_is_system(const wchar_t *path_w);
-extern int path_is_program_files(const wchar_t *path_w);
-extern BOOL PatchByte(LPVOID Address, BYTE Byte);
 extern wchar_t *our_process_path_w;
 extern int EntryPointRegister;
 extern unsigned int TraceDepthLimit, StepLimit, Type0, Type1, Type2;
@@ -134,15 +133,39 @@ void parse_config_line(char* line)
 			g_config.hook_range = atoi(value);
 			DebugOutput("Config: hook range limit set to %d", g_config.hook_range);
 		}
-		else if (!strcmp(key, "hook-type")) { //Valid for 32-bit analyses only. Specifies the hook type to use: direct, indirect, or safe. Safe attempts a Detours-style hook.
-#ifndef _WIN64
-			if (!strcmp(value, "direct"))
-				g_config.hook_type = HOOK_JMP_DIRECT;
-			else if (!strcmp(value, "indirect"))
+		else if (!strcmp(key, "hook-type")) {
+			if (!strcmp(value, "indirect")) {
 				g_config.hook_type = HOOK_JMP_INDIRECT;
-			else if (!strcmp(value, "safe"))
+				DebugOutput("Config: Indirect hooking selected.\n");
+			}
+			else if (!strcmp(value, "pushret")) {
+				g_config.hook_type = HOOK_PUSH_RETN;
+				DebugOutput("Config: Push-ret hooking selected.\n");
+			}
+#ifndef _WIN64
+			else if (!strcmp(value, "direct")) {
+				g_config.hook_type = HOOK_JMP_DIRECT;
+				DebugOutput("Config: Direct hooking selected.\n");
+			}
+			else if (!strcmp(value, "safe")) {
 				g_config.hook_type = HOOK_SAFEST;
+				DebugOutput("Config: Safest hooking selected.\n");
+			}
 #endif
+		}
+#ifdef _WIN64
+		else if (!stricmp(key, "hook-low")) {
+			g_config.hook_low = value[0];
+			if (g_config.hook_low) {
+				DebugOutput("Config: Hook 'low' enabled (trampoline address < 2GB)\n");
+				g_config.hook_type = HOOK_PUSH_RETN;
+			}
+		}
+#endif
+		else if (!stricmp(key, "hook-restore")) {
+			g_config.hook_restore = value[0] == '1';
+			if (g_config.hook_restore)
+				DebugOutput("Config: Attempt hook restoration of modifications detected by unhook thread\n");
 		}
 		else if (!strcmp(key, "disable_hook_content")) { //Set to 1 to remove functionality of all hooks except those critical for monitoring other processes. Set to 2 to apply to all hooks.
 			g_config.disable_hook_content = atoi(value);
@@ -187,6 +210,13 @@ void parse_config_line(char* line)
 		else if (!strcmp(key, "no-stealth")) { // Set to 1 to disable anti-anti-VM/sandbox code enabled by default.
 			g_config.no_stealth = value[0] == '1';
 		}
+		else if (!strcmp(key, "cpu-count")) {
+			unsigned int val = (unsigned int)strtoul(value, NULL, 10);
+			if (val > 0) {
+				g_config.spoofed_cpu_count = val;
+				DebugOutput("Config: Spoofed CPU core count set to %u", g_config.spoofed_cpu_count);
+			}
+		}
 		else if (!strcmp(key, "buffer-max")) {
 			buffer_log_max = (unsigned int)strtoul(value, NULL, 10);
 		}
@@ -227,18 +257,42 @@ void parse_config_line(char* line)
 		}
 		else if (!strcmp(key, "dump-limit")) { //Override the default dump limit of 10 payloads
 			g_config.dump_limit = (unsigned int)strtoul(value, NULL, 10);
-			DebugOutput("Dropped file limit set to %d.\n", g_config.dump_limit);
+			if (g_config.dump_limit)
+				DebugOutput("Payload capture limit set to %d.\n", g_config.dump_limit);
+			else
+				DebugOutput("Payload capture limit disabled.\n");
 		}
 		else if (!strcmp(key, "dropped-limit")) { //Override the default dropped file limit of 100 files
 			g_config.dropped_limit = (unsigned int)strtoul(value, NULL, 10);
 			DebugOutput("Dropped file limit set to %d.\n", g_config.dropped_limit);
 		}
+		else if (!strcmp(key, "protected-pids")) {
+			g_config.protected_pids = atoi(value);
+			if (g_config.protected_pids)
+				DebugOutput("Config: Process protection enabled.");
+			else
+				DebugOutput("Config: Process protection disabled.");
+		}
 		else if (!strcmp(key, "ntdll-protect")) {
 			g_config.ntdll_protect = (unsigned int)strtoul(value, NULL, 10);
-            if (g_config.ntdll_protect)
-                DebugOutput("Config: ntdll write protection enabled.");
+			if (g_config.ntdll_protect)
+				DebugOutput("Config: ntdll write protection enabled.");
+			else
+				DebugOutput("Config: ntdll write protection disabled.");
+		}
+		else if (!strcmp(key, "ntdll-unhook")) {
+			g_config.ntdll_unhook = (unsigned int)strtoul(value, NULL, 10);
+			if (g_config.ntdll_unhook)
+				DebugOutput("Config: ntdll unhook protection enabled.");
+			else
+				DebugOutput("Config: ntdll unhook protection disabled.");
+		}
+		else if (!strcmp(key, "hook-protect")) {
+			g_config.hook_protect = (unsigned int)strtoul(value, NULL, 10);
+            if (g_config.hook_protect)
+                DebugOutput("Config: hook write protection enabled.");
             else
-                DebugOutput("Config: ntdll write protection disabled.");
+                DebugOutput("Config: hook write protection disabled.");
 		}
 		else if (!strcmp(key, "ntdll-remap")) {
 			g_config.ntdll_remap = (unsigned int)strtoul(value, NULL, 10);
@@ -260,6 +314,21 @@ void parse_config_line(char* line)
 					*p2 = '\0';
 				}
 				g_config.excluded_apinames[x++] = strdup(p);
+				if (p2 == NULL)
+					break;
+				p = p2 + 1;
+			}
+		}
+		else if (!strcmp(key, "include-apis")) { // Only include the colon-separated list of APIs
+			unsigned int x = 0;
+			char *p2;
+			p = value;
+			while (p && x < EXCLUSION_MAX) {
+				p2 = strchr(p, ':');
+				if (p2) {
+					*p2 = '\0';
+				}
+				g_config.included_apinames[x++] = strdup(p);
 				if (p2 == NULL)
 					break;
 				p = p2 + 1;
@@ -361,32 +430,31 @@ void parse_config_line(char* line)
 			if (p) {
 				*p = '\0';
 				char *p2 = p+1;
-				unsigned int byte = strtoul(value, NULL, 0);
 				int delta=0;
-				p = strchr(p2, '+');
+				p = strchr(value, '+');
 				if (p) {
 					delta = strtoul(p+1, NULL, 0);
 					DebugOutput("Config: Delta 0x%x.\n", delta);
 					*p = '\0';
 				}
 				else {
-					p = strchr(p2, '-');
+					p = strchr(value, '-');
 					if (p) {
 						delta = - (int)strtoul(p+1, NULL, 0);
 						DebugOutput("Config: Delta 0x%x.\n", delta);
 						*p = '\0';
 					}
 				}
-				PVOID address = (PVOID)(DWORD_PTR)strtoul(p2, NULL, 0);
+				PVOID address = (PVOID)(DWORD_PTR)strtoull(value, NULL, 0);
 				if (address) {
-					DebugOutput("Config: patching address 0x%p with byte 0x%x", address, byte);
-					PatchByte(address, (BYTE)byte);
+					DebugOutput("Config: patching address 0x%p with bytes %s", address, p2);
+					PatchBytes(address, p2);
 				}
 				else
-					DebugOutput("Config: patch address missing invalid: %s", value);
+					DebugOutput("Config: patch address missing or invalid: %s", value);
 			}
 			else
-				DebugOutput("Config: patch byte missing");
+				DebugOutput("Config: patch bytes missing");
 		}
 		else if (!stricmp(key, "bp")) {
 			unsigned int x = 0;
@@ -799,43 +867,64 @@ void parse_config_line(char* line)
 			}
 		}
 		else if (!stricmp(key, "br1")) {
-			int delta=0;
-			p = strchr(value, '+');
-			if (p) {
-				delta = strtoul(p+1, NULL, 0);
-				DebugOutput("Config: Delta 0x%x.\n", delta);
+			p = strchr(value, ':');
+			if (p && *(p+1) == ':') {
+				g_config.br1 = 0;
 				*p = '\0';
+				*(p+1) = '\0';
+				HANDLE Module = NULL;
+				if (!stricmp(value, "capemon"))
+					Module = (HANDLE)g_our_dll_base;
+				else
+					Module = GetModuleHandle(value);
+				g_config.break_on_apiname = strdup(p+2);
+				g_config.break_on_modname = strdup(value);
+				if (Module)
+					g_config.br1 = GetProcAddress(Module, p+2);
+				else
+					DebugOutput("Config: Failed to get base for module (%s).\n", g_config.break_on_modname);
+				if (g_config.br1) {
+					g_config.debugger = 1;
+					g_config.bpva1 = 1;
+					DebugOutput("Config: br1 set to 0x%p (%s::%s).\n", g_config.br1, g_config.break_on_modname, g_config.break_on_apiname);
+				}
+				else if (Module) {
+					unsigned int delta = strtoul(p+2, NULL, 0);
+					if (delta) {
+						g_config.br1 = (PBYTE)Module + delta;
+						g_config.debugger = 1;
+						g_config.bpva1 = 1;
+						DebugOutput("Config: br1 set to 0x%p (%s::%s).\n", g_config.br1, g_config.break_on_modname, g_config.break_on_apiname);
+					}
+					else
+						DebugOutput("Config: Failed to get address for function %s::%s\n", g_config.break_on_modname, p+2);
+				}
 			}
 			else {
-				p = strchr(value, '-');
+				int delta=0;
+				p = strchr(value, '+');
 				if (p) {
-					delta = - (int)strtoul(p+1, NULL, 0);
+					delta = strtoul(p+1, NULL, 0);
 					DebugOutput("Config: Delta 0x%x.\n", delta);
 					*p = '\0';
 				}
-			}
-			g_config.br1 = (PVOID)(DWORD_PTR)strtoul(value, NULL, 0);
-			if (g_config.br1) {
-				g_config.debugger = 1;
-				if (delta) {
-					DebugOutput("Config: br1 was 0x%x (delta 0x%x).\n", g_config.br1, delta);
-					g_config.br1 = (PVOID)(DWORD_PTR)((PUCHAR)g_config.br1 + delta);
+				else {
+					p = strchr(value, '-');
+					if (p) {
+						delta = - (int)strtoul(p+1, NULL, 0);
+						DebugOutput("Config: Delta 0x%x.\n", delta);
+						*p = '\0';
+					}
 				}
-				DebugOutput("Config: br1 set to 0x%x (break-on-return)\n", g_config.br1);
-			}
-		}
-		else if (!stricmp(key, "br2")) {
-			g_config.br2 = (PVOID)(DWORD_PTR)strtoul(value, NULL, 0);
-			if (g_config.br2) {
-				g_config.debugger = 1;
-				DebugOutput("Config: br2 set to 0x%x (break-on-return)\n", g_config.br2);
-			}
-		}
-		else if (!stricmp(key, "br3")) {
-			g_config.br3 = (PVOID)(DWORD_PTR)strtoul(value, NULL, 0);
-			if (g_config.br3) {
-				g_config.debugger = 1;
-				DebugOutput("Config: br3 set to 0x%x (break-on-return)\n", g_config.br3);
+				g_config.br1 = (PVOID)(DWORD_PTR)strtoul(value, NULL, 0);
+				if (g_config.br1) {
+					g_config.debugger = 1;
+					if (delta) {
+						DebugOutput("Config: br1 was 0x%x (delta 0x%x).\n", g_config.br1, delta);
+						g_config.br1 = (PVOID)(DWORD_PTR)((PUCHAR)g_config.br1 + delta);
+					}
+					DebugOutput("Config: br1 set to 0x%x (break-on-return)\n", g_config.br1);
+				}
 			}
 		}
 		else if (!stricmp(key, "sysbp")) {
@@ -848,18 +937,18 @@ void parse_config_line(char* line)
 					*p2 = '\0';
 				}
 				int delta=0;
-				p2 = strchr(value, '+');
-				if (p2) {
-					delta = strtoul(p2+1, NULL, 0);
+				char *p3 = strchr(value, '+');
+				if (p3) {
+					delta = strtoul(p3+1, NULL, 0);
 					DebugOutput("Config: Delta 0x%x.\n", delta);
-					*p2 = '\0';
+					*p3 = '\0';
 				}
 				else {
-					p2 = strchr(value, '-');
-					if (p2) {
-						delta = - (int)strtoul(p2+1, NULL, 0);
+					p3 = strchr(value, '-');
+					if (p3) {
+						delta = - (int)strtoul(p3+1, NULL, 0);
 						DebugOutput("Config: Delta 0x%x.\n", delta);
-						*p2 = '\0';
+						*p3 = '\0';
 					}
 				}
 				for (unsigned int i = 0; i < ARRAYSIZE(g_config.sysbp); i++) {
@@ -882,6 +971,15 @@ void parse_config_line(char* line)
 		else if (!stricmp(key, "sysbpmode")) {
 			g_config.sysbpmode = (unsigned int)strtoul(value, NULL, 10);
 			DebugOutput("Syscall breakpoint mode set to %d.\n", g_config.sysbpmode);
+		}
+		else if (!stricmp(key, "softbpmode")) {
+			g_config.softbpmode = (unsigned int)strtoul(value, NULL, 10);
+			if (!g_config.softbpmode)
+				DebugOutput("Software breakpoints set to one-shot (default, mode 0).\n");
+			else if (g_config.softbpmode == 1)
+				DebugOutput("Software breakpoint mode set to persistent (mode 1)\n");
+			else
+				DebugOutput("Software breakpoint mode set to unknown mode %d.\n", g_config.softbpmode);
 		}
 		else if (!stricmp(key, "count0")) {
 			g_config.count0 = (unsigned int)(DWORD_PTR)strtoul(value, NULL, 0);
@@ -942,6 +1040,11 @@ void parse_config_line(char* line)
 				g_config.step_out = '1';
 				DebugOutput("Config: Step-out breakpoint set to 0x%x.\n", g_config.bp0);
 			}
+		}
+		else if (!stricmp(key, "stepmode")) {
+			g_config.stepmode = (unsigned int)strtoul(value, NULL, 10);
+			if (g_config.stepmode)
+				DebugOutput("Stepmode %d set.\n", g_config.stepmode);
 		}
 		else if (!stricmp(key, "dumpsize")) {
 			DumpSize = (SIZE_T)strtoul(value, NULL, 0);
@@ -1173,7 +1276,7 @@ void parse_config_line(char* line)
 			else
 				DebugOutput("Full process memory dumps disabled.\n");
 		}
-		else if (!stricmp(key, "import_reconstruction")) {
+		else if (!stricmp(key, "import-reconstruction") || !stricmp(key, "imprec")) {
 			g_config.import_reconstruction = value[0] == '1';
 			if (g_config.import_reconstruction)
 				DebugOutput("Import reconstruction of process dumps enabled.\n");
@@ -1187,6 +1290,13 @@ void parse_config_line(char* line)
 			else
 				DebugOutput("Terminate processes on terminate_event disabled.\n");
 		}
+		else if (!stricmp(key, "unhook-on-terminate")) {
+			g_config.unhook_on_terminate = value[0] == '1';
+			if (g_config.unhook_on_terminate)
+				DebugOutput("Unhook monitor on terminate_event enabled.\n");
+			else
+				DebugOutput("Unhook monitor on terminate_event disabled.\n");
+		}
 		else if (!stricmp(key, "branch-trace")) {
 			g_config.branch_trace = value[0] == '1';
 			if (g_config.branch_trace)
@@ -1199,7 +1309,7 @@ void parse_config_line(char* line)
 			else if (g_config.unpacker == 2)
 				DebugOutput("Active unpacking of payloads enabled\n");
 		}
-		else if (!stricmp(key, "injection")) { //When set to 1 this will enable CAPE’s capture of injected payloads between processes
+		else if (!stricmp(key, "injection")) { //When set to 1 this will enable CAPE's capture of injected payloads between processes
 			g_config.injection = value[0] == '1';
 			if (g_config.injection)
 				DebugOutput("Capture of injected payloads enabled.\n");
@@ -1248,12 +1358,22 @@ void parse_config_line(char* line)
 			else
 				DebugOutput("In-monitor YARA scans disabled.\n");
 		}
+		else if (!stricmp(key, "yara-timeout")) {
+			g_config.yara_timeout = (int)strtol(value, NULL, 10);
+			if (g_config.yara_timeout <= 0)
+				DebugOutput("In-monitor YARA scan timeout set to unlimited.\n");
+			else
+				DebugOutput("In-monitor YARA scan timeout set to %d seconds.\n", g_config.yara_timeout);
+		}
 		else if (!stricmp(key, "amsidump")) {
 			g_config.amsidump = value[0] == '1';
 			if (g_config.amsidump)
 				DebugOutput("AMSI dumping enabled.\n");
-			else
-				DebugOutput("AMSI dumping disabled.\n");
+		}
+		else if (!stricmp(key, "jit-dumps")) {
+			g_config.jit_dumps = (unsigned int)strtoul(value, NULL, 10);
+			if (g_config.jit_dumps)
+				DebugOutput(".NET JIT cache dumps enabled, limit %d\n", g_config.jit_dumps);
 		}
 		else if (!stricmp(key, "minhook")) {
 			g_config.minhook = value[0] == '1';
@@ -1264,6 +1384,11 @@ void parse_config_line(char* line)
 			g_config.zerohook = value[0] == '1';
 			if (g_config.zerohook)
 				DebugOutput("All* hooks disabled (*except essential)\n");
+		}
+		else if (!stricmp(key, "native")) {
+			g_config.native = value[0] == '1';
+			if (g_config.native)
+				DebugOutput("Native hooks only (ntdll)\n");
 		}
 		else if (!stricmp(key, "tlsdump")) {
 			g_config.tlsdump = value[0] == '1';
@@ -1285,17 +1410,17 @@ void parse_config_line(char* line)
 			else
 				DebugOutput("Scans/dumps while loader lock held disabled.\n");
 		}
-		else if (!stricmp(key, "plugx")) {
-			g_config.plugx = value[0] == '1';
-			if (g_config.plugx)
-				DebugOutput("PlugX package enabled.\n");
-		}
 		else if (!stricmp(key, "syscall")) {
 			g_config.syscall = value[0] == '1';
 			if (g_config.syscall)
 				DebugOutput("Syscall hooks enabled.\n");
 			else
 				DebugOutput("Syscall hooks disabled.\n");
+		}
+		else if (!stricmp(key, "modulenames")) {
+			g_config.modulenames = value[0] == '1';
+			if (g_config.modulenames)
+				DebugOutput("Module names enabled in trace output\n");
 		}
 		else if (!stricmp(key, "loopskip")) {
 			g_config.loopskip = value[0] == '1';
@@ -1313,6 +1438,34 @@ void parse_config_line(char* line)
 			if (g_config.interactive == 1)
 				DebugOutput("Interactive desktop enabled.\n");
 		}
+		else if (!stricmp(key, "idbg")) {
+			g_config.idbg = value[0] == '1';
+			if (g_config.idbg)
+				DebugOutput("Interactive debugger enabled (CAPEsolo)\n");
+		}
+		else if (!stricmp(key, "snaps")) {
+			g_config.snaps = value[0] == '1';
+			if (g_config.snaps)
+				DebugOutput("Loader snaps enabled.\n");
+		}
+		else if (!stricmp(key, "hook-watch")) {
+			g_config.hook_watch = value[0] == '1';
+			if (g_config.hook_watch)
+				DebugOutput("Config: Hook watch enabled.\n");
+		}
+		else if (!stricmp(key, "sleep-skip-seconds")) {
+			g_config.sleep_skip_seconds = (int)strtoul(value, NULL, 10);
+			DebugOutput("Config: Sleep skip seconds set to %d.\n", g_config.sleep_skip_seconds);
+		}
+		else if (!stricmp(key, "monitor")) {
+			DWORD pid = (unsigned int)strtoul(value, NULL, 10);
+			if (!pid && !stricmp(value, "explorer"))
+				GetWindowThreadProcessId(GetShellWindow(), &pid);
+			if (pid) {
+				ProcessMessage(pid, 0);
+				DebugOutput("Config: Injected monitor into pid %d.\n", pid);
+			}
+		}
 		else if (stricmp(key, "no-iat"))
 			DebugOutput("Monitor config - unrecognised key %s.\n", key);
 
@@ -1321,7 +1474,7 @@ void parse_config_line(char* line)
 	}
 }
 
-int read_config(void)
+void read_config(void)
 {
 	char buf[32768], config_fname[MAX_PATH];
 	FILE *fp;
@@ -1334,6 +1487,8 @@ int read_config(void)
 #else
 	g_config.hook_type = HOOK_HOTPATCH_JMP_INDIRECT;
 #endif
+	g_config.hook_restore = 1;
+	g_config.protected_pids = 1;
 	g_config.ntdll_protect = 1;
 	g_config.ntdll_remap = 1;
 	g_config.procdump = 1;
@@ -1345,13 +1500,13 @@ int read_config(void)
 	g_config.api_cap = 5000;
 	g_config.api_rate_cap = 1;
 	g_config.yarascan = 1;
+	g_config.yara_timeout = 1;
 	g_config.loaderlock_scans = 1;
-	g_config.amsidump = 1;
+	g_config.spoofed_cpu_count = SPOOFED_CPU_CORE_NUM;
 	g_config.syscall = 1;
+	g_config.sleep_skip_seconds = 10;
 
 	StepLimit = SINGLE_STEP_LIMIT;
-
-	strcpy(g_config.results, g_config.analyzer);
 
 	memset(g_config.str, 0, MAX_PATH);
 	memset(g_config.pythonpath, 0, MAX_PATH);
@@ -1365,6 +1520,8 @@ int read_config(void)
 	PathRemoveFileSpec(g_config.analyzer); // remove filename
 	sprintf(config_fname, "%s\\%u.ini", g_config.analyzer, GetCurrentProcessId());
 
+	strcpy(g_config.results, g_config.analyzer);
+
 	fp = fopen(config_fname, "r");
 
 	// backward compatibility
@@ -1374,17 +1531,14 @@ int read_config(void)
 		fp = fopen(config_fname, "r");
 	}
 
-	// for debugging purposes
 	if (fp == NULL) {
 		memset(config_fname, 0, sizeof(config_fname));
 		sprintf(config_fname, "%s\\config.ini", g_config.analyzer);
 		fp = fopen(config_fname, "r");
-		if (fp == NULL)
-			return 0;
 	}
 
-	memset(buf, 0, sizeof(buf));
 	if (fp) {
+		memset(buf, 0, sizeof(buf));
 		while (fgets(buf, sizeof(buf), fp) != NULL) {
 			// cut off the newline
 			char *p = strchr(buf, '\r');
@@ -1448,7 +1602,7 @@ int read_config(void)
 		ImageBaseRemapped = TRUE;
 
 	if (!our_process_name)
-		return 1;
+		return;
 
 	if (!_stricmp(our_process_name, "explorer.exe") && g_config.interactive == 1)
 	{
@@ -1469,6 +1623,7 @@ int read_config(void)
 			g_config.procmemdump = 0;
 			g_config.yarascan = 0;
 			g_config.ntdll_protect = 0;
+			g_config.hook_restore = 0;
 			DebugOutput("Firefox-specific hook-set enabled.\n");
         }
 		if (!_stricmp(our_process_name, "iexplore.exe"))
@@ -1479,6 +1634,7 @@ int read_config(void)
 			g_config.ntdll_protect = 0;
 			g_config.procmemdump = 0;
 			g_config.yarascan = 0;
+			g_config.hook_restore = 0;
 			DebugOutput("Internet Explorer-specific hook-set enabled.\n");
         }
 
@@ -1490,6 +1646,7 @@ int read_config(void)
 			g_config.ntdll_protect = 0;
 			g_config.yarascan = 0;
 			g_config.procmemdump = 0;
+			g_config.hook_restore = 0;
 			DebugOutput("Edge-specific hook-set enabled.\n");
 		}
 
@@ -1501,6 +1658,7 @@ int read_config(void)
 			g_config.ntdll_protect = 0;
 			g_config.yarascan = 0;
 			g_config.procmemdump = 0;
+			g_config.hook_restore = 0;
 			DebugOutput("Chrome-specific hook-set enabled.\n");
 		}
 
@@ -1512,6 +1670,7 @@ int read_config(void)
 			g_config.procmemdump = 0;
 			g_config.yarascan = 0;
 			g_config.ntdll_protect = 0;
+			g_config.hook_restore = 0;
 			DebugOutput("Microsoft Office settings enabled.\n");
         }
 	}
@@ -1614,5 +1773,5 @@ int read_config(void)
 		}
 	}
 
-	return 1;
+	return;
 }

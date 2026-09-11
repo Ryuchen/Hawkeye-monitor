@@ -42,12 +42,13 @@ extern void ProtectionHandler(PVOID BaseAddress, ULONG Protect, PULONG OldProtec
 extern void FreeHandler(PVOID BaseAddress), ProcessMessage(DWORD ProcessId, DWORD ThreadId);
 extern void ProcessTrackedRegion(), DebuggerShutdown(), DumpStrings();
 extern LONG WINAPI mini_handler(__in struct _EXCEPTION_POINTERS *ExceptionInfo);
-
-extern HANDLE g_terminate_event_handle;
+extern BOOLEAN is_monitor_thread(DWORD tid);
+extern BOOL dll_is_hooked(const wchar_t *library);
 extern BOOL CAPEExceptionDispatcher(PEXCEPTION_RECORD ExceptionRecord, PCONTEXT Context);
 extern void file_handle_terminate();
 extern int DoProcessDump();
 extern PVOID GetHookCallerBase();
+extern HANDLE g_terminate_event_handle;
 extern BOOL ProcessDumped;
 
 static BOOL ntdll_protect_logged;
@@ -99,6 +100,20 @@ HOOKDEF(BOOL, WINAPI, Process32FirstW,
 	return ret;
 }
 
+HOOKDEF(BOOL, WINAPI, Module32FirstW,
+	__in HANDLE hSnapshot,
+	__out LPMODULEENTRY32W lpme
+	) {
+	BOOL ret = Old_Module32FirstW(hSnapshot, lpme);
+
+	if (ret)
+		LOQ_bool("process", "uii", "ModuleName", lpme->szModule, "ModuleID", lpme->th32ModuleID, "ProcessId", lpme->th32ProcessID);
+	else
+		LOQ_bool("process", "");
+
+	return ret;
+}
+
 HOOKDEF(BOOL, WINAPI, Module32NextW,
 	__in HANDLE hSnapshot,
 	__out LPMODULEENTRY32W lpme
@@ -113,16 +128,84 @@ HOOKDEF(BOOL, WINAPI, Module32NextW,
 	return ret;
 }
 
-HOOKDEF(BOOL, WINAPI, Module32FirstW,
+HOOKDEF(BOOL, WINAPI, Thread32Next,
 	__in HANDLE hSnapshot,
-	__out LPMODULEENTRY32W lpme
-	) {
-	BOOL ret = Old_Module32FirstW(hSnapshot, lpme);
+	__out LPTHREADENTRY32 lpte
+) {
+	BOOL ret = Old_Thread32Next(hSnapshot, lpte);
 
 	if (ret)
-		LOQ_bool("process", "uii", "ModuleName", lpme->szModule, "ModuleID", lpme->th32ModuleID, "ProcessId", lpme->th32ProcessID);
+		LOQ_bool("process", "ii", "ThreadID", lpte->th32ThreadID, "ProcessId", lpte->th32OwnerProcessID);
 	else
 		LOQ_bool("process", "");
+
+	// ignore our own threads
+	if (ret && lpte && lpte->th32OwnerProcessID && GetCurrentProcessId() == lpte->th32OwnerProcessID && lpte->th32ThreadID && is_monitor_thread(lpte->th32ThreadID)) {
+		do {
+			ret = Old_Thread32Next(hSnapshot, lpte);
+		} while (ret && lpte && GetCurrentProcessId() == lpte->th32OwnerProcessID && is_monitor_thread(lpte->th32ThreadID));
+	}
+
+	return ret;
+}
+
+HOOKDEF(BOOL, WINAPI, Thread32First,
+	__in HANDLE hSnapshot,
+	__out LPTHREADENTRY32 lpte
+) {
+	BOOL ret = Old_Thread32First(hSnapshot, lpte);
+
+	if (ret)
+		LOQ_bool("process", "ii", "ThreadID", lpte->th32ThreadID, "ProcessId", lpte->th32OwnerProcessID);
+	else
+		LOQ_bool("process", "");
+
+	// ignore our own threads
+	if (ret && lpte && lpte->th32OwnerProcessID && GetCurrentProcessId() == lpte->th32OwnerProcessID && lpte->th32ThreadID && is_monitor_thread(lpte->th32ThreadID)) {
+		do {
+			ret = Old_Thread32Next(hSnapshot, lpte);
+		} while (ret && lpte && GetCurrentProcessId() == lpte->th32OwnerProcessID && is_monitor_thread(lpte->th32ThreadID));
+	}
+
+	return ret;
+}
+
+HOOKDEF(BOOL, WINAPI, WTSEnumerateProcessesW,
+	_In_	HANDLE				hServer,
+	_In_	DWORD				Reserved,
+	_In_	DWORD				Version,
+	_Out_	PWTS_PROCESS_INFOW* ppProcessInfo,
+	_Out_	DWORD*				pCount
+) {
+	BOOL ret = Old_WTSEnumerateProcessesW(hServer, Reserved, Version, ppProcessInfo, pCount);
+
+	LOQ_bool("process", "");
+
+	return ret;
+}
+
+HOOKDEF(BOOL, WINAPI, WTSEnumerateProcessesExW,
+	_In_	HANDLE	hServer,
+	_Inout_	DWORD*	pLevel,
+	_In_	DWORD	SessionId,
+	_Out_	LPWSTR*	ppProcessInfo,
+	_Out_	DWORD*	pCount
+) {
+	BOOL ret = Old_WTSEnumerateProcessesExW(hServer, pLevel, SessionId, ppProcessInfo, pCount);
+
+	LOQ_bool("process", "");
+
+	return ret;
+}
+
+HOOKDEF(BOOL, WINAPI, K32EnumProcesses,
+	_Out_writes_bytes_(cb)	DWORD*	lpidProcess,
+	_In_					DWORD	cb,
+	_Out_					LPDWORD	lpcbNeeded
+) {
+	BOOL ret = Old_K32EnumProcesses(lpidProcess, cb, lpcbNeeded);
+
+	LOQ_bool("process", "");
 
 	return ret;
 }
@@ -309,6 +392,14 @@ HOOKDEF(NTSTATUS, WINAPI, NtCreateUserProcess,
 	if (ProcessParameters == NULL)
 		ProcessParameters = &_ProcessParameters;
 
+	// Anti-ping delay
+	if (ProcessParameters && ProcessParameters->CommandLine.Buffer) {
+		int n_val;
+		PWSTR cmd = ProcessParameters->CommandLine.Buffer;
+		if (swscanf(cmd, L"ping 127.0.0.1 -n %d", &n_val) == 1 && n_val > 1)
+			wsprintfW(cmd, L"ping 127.0.0.1 -n 1");
+	}
+
 	ret = Old_NtCreateUserProcess(ProcessHandle, ThreadHandle,
 		ProcessDesiredAccess, ThreadDesiredAccess,
 		ProcessObjectAttributes, ThreadObjectAttributes,
@@ -317,7 +408,7 @@ HOOKDEF(NTSTATUS, WINAPI, NtCreateUserProcess,
 
 	DWORD pid = pid_from_process_handle(*ProcessHandle);
 
-	LOQ_ntstatus("process", "PPhhOOool", "ProcessHandle", ProcessHandle,
+	LOQ_ntstatus("process", "PPhhOOoool", "ProcessHandle", ProcessHandle,
 		"ThreadHandle", ThreadHandle,
 		"ProcessDesiredAccess", ProcessDesiredAccess,
 		"ThreadDesiredAccess", ThreadDesiredAccess,
@@ -325,6 +416,7 @@ HOOKDEF(NTSTATUS, WINAPI, NtCreateUserProcess,
 		"ThreadName", ThreadObjectAttributes,
 		"ImagePathName", &ProcessParameters->ImagePathName,
 		"CommandLine", &ProcessParameters->CommandLine,
+		"DllPath", &ProcessParameters->DllPath,
 		"ProcessId", pid);
 
 	if (NT_SUCCESS(ret)) {
@@ -362,9 +454,17 @@ HOOKDEF(NTSTATUS, WINAPI, RtlCreateUserProcess,
 		ProcessParameters, ProcessSecurityDescriptor,
 		ThreadSecurityDescriptor, ParentProcess, InheritHandles, DebugPort,
 		ExceptionPort, ProcessInformation);
+
 	DWORD pid = pid_from_process_handle(ProcessInformation->ProcessHandle);
-	LOQ_ntstatus("process", "ohpl", "ImagePath", ImagePath, "ObjectAttributes", ObjectAttributes,
-		"ParentHandle", ParentProcess, "ProcessId", pid);
+
+	LOQ_ntstatus("process", "ohpoool", "ImagePath", ImagePath,
+		"ObjectAttributes", ObjectAttributes,
+		"ParentHandle", ParentProcess,
+		"ImagePathName", &ProcessParameters->ImagePathName,
+		"CommandLine", &ProcessParameters->CommandLine,
+		"DllPath", &ProcessParameters->DllPath,
+		"ProcessId", pid);
+
 	if (NT_SUCCESS(ret)) {
 		DWORD tid = tid_from_thread_handle(ProcessInformation->ThreadHandle);
 		if (!g_config.single_process) {
@@ -560,10 +660,38 @@ HOOKDEF(NTSTATUS, WINAPI, NtResumeProcess,
 	DWORD pid = pid_from_process_handle(ProcessHandle);
 	if (g_config.injection)
 		ResumeProcessHandler(ProcessHandle, pid);
-	pipe("RESUME:%d", pid);
+	pipe("RESUME:%d,0", pid);
 	ret = Old_NtResumeProcess(ProcessHandle);
 	LOQ_ntstatus("process", "pl", "ProcessHandle", ProcessHandle, "ProcessId", pid);
 	return ret;
+}
+
+HOOKDEF(NTSTATUS, WINAPI, NtAdjustPrivilegesToken,
+    IN HANDLE               TokenHandle,
+    IN BOOLEAN              DisableAllPrivileges,
+    IN PTOKEN_PRIVILEGES    NewState OPTIONAL,
+    IN ULONG                BufferLength,
+    OUT PTOKEN_PRIVILEGES   PreviousState OPTIONAL,
+    OUT PULONG              ReturnLength OPTIONAL
+) {
+    char privnames[512] = "";
+    if (NewState && NewState->PrivilegeCount) {
+        for (DWORD i = 0; i < NewState->PrivilegeCount; i++) {
+            char name[64] = "";
+            DWORD nameLen = sizeof(name);
+            if (LookupPrivilegeNameA(NULL, &NewState->Privileges[i].Luid, name, &nameLen)) {
+                if (i > 0)
+                    strncat(privnames, ",", sizeof(privnames) - strlen(privnames) - 1);
+                strncat(privnames, name, sizeof(privnames) - strlen(privnames) - 1);
+            }
+        }
+    }
+
+    NTSTATUS ret = Old_NtAdjustPrivilegesToken(TokenHandle, DisableAllPrivileges, NewState, BufferLength, PreviousState, ReturnLength);
+
+    LOQ_ntstatus("process", "hiis", "TokenHandle", TokenHandle, "DisableAllPrivileges", DisableAllPrivileges, "PrivilegeCount", NewState ? NewState->PrivilegeCount : 0, "Privileges", privnames);
+
+    return ret;
 }
 
 int process_shutting_down;
@@ -657,16 +785,18 @@ HOOKDEF(NTSTATUS, WINAPI, NtCreateSection,
 	__in	  ULONG AllocationAttributes,
 	__in_opt  HANDLE FileHandle
 ) {
-	NTSTATUS ret = Old_NtCreateSection(SectionHandle, DesiredAccess,
-		ObjectAttributes, MaximumSize, SectionPageProtection,
-		AllocationAttributes, FileHandle);
-	LOQ_ntstatus("process", "Phop", "SectionHandle", SectionHandle,
-		"DesiredAccess", DesiredAccess, "ObjectAttributes", ObjectAttributes ? ObjectAttributes->ObjectName : NULL,
-		"FileHandle", FileHandle);
+	NTSTATUS ret = Old_NtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes, MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
 
-	if (NT_SUCCESS(ret) && FileHandle && (DesiredAccess & SECTION_MAP_WRITE)) {
+	wchar_t *FileName = calloc(UNICODE_STRING_MAX_BYTES, sizeof(wchar_t));
+
+	path_from_handle(FileHandle, FileName, UNICODE_STRING_MAX_BYTES);
+
+	LOQ_ntstatus("process", "PhopF", "SectionHandle", SectionHandle,  "DesiredAccess", DesiredAccess, "ObjectAttributes", ObjectAttributes ? ObjectAttributes->ObjectName : NULL, "FileHandle", FileHandle, "FileName", FileName);
+
+	if (NT_SUCCESS(ret) && FileHandle && (DesiredAccess & SECTION_MAP_WRITE))
 		file_write(FileHandle);
-	}
+
+	free(FileName);
 
 	return ret;
 }
@@ -711,21 +841,17 @@ HOOKDEF(NTSTATUS, WINAPI, NtMapViewOfSection,
 	__in	 ULONG AllocationType,
 	__in	 ULONG Win32Protect
 ) {
-	char *ModuleName = NULL;
-	unsigned int DllRVA;
+	NTSTATUS ret = Old_NtMapViewOfSection(SectionHandle, ProcessHandle, BaseAddress, ZeroBits, CommitSize, SectionOffset, ViewSize, InheritDisposition, AllocationType, Win32Protect);
 
-	NTSTATUS ret = Old_NtMapViewOfSection(SectionHandle, ProcessHandle, BaseAddress, ZeroBits,
-		CommitSize, SectionOffset, ViewSize, InheritDisposition, AllocationType, Win32Protect);
 	DWORD pid = pid_from_process_handle(ProcessHandle);
+	UNICODE_STRING *module_name = get_module_name((ULONG_PTR)*BaseAddress);
 
-	ModuleName = convert_address_to_dll_name_and_offset((ULONG_PTR)*BaseAddress, &DllRVA);
-
-	if (!ModuleName)
+	if (!module_name)
 		LOQ_ntstatus("process", "ppPpPhs", "SectionHandle", SectionHandle,"ProcessHandle", ProcessHandle, "BaseAddress", BaseAddress,
 			"SectionOffset", SectionOffset, "ViewSize", ViewSize, "Win32Protect", Win32Protect, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
 	else
 		LOQ_ntstatus("process", "ppPspPhs", "SectionHandle", SectionHandle,"ProcessHandle", ProcessHandle, "BaseAddress", BaseAddress,
-			"ModuleName", ModuleName, "SectionOffset", SectionOffset, "ViewSize", ViewSize, "Win32Protect", Win32Protect, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
+			"ModuleName", module_name, "SectionOffset", SectionOffset, "ViewSize", ViewSize, "Win32Protect", Win32Protect, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
 
 	if (NT_SUCCESS(ret)) {
 		if (g_config.injection)
@@ -734,13 +860,9 @@ HOOKDEF(NTSTATUS, WINAPI, NtMapViewOfSection,
 			ProcessMessage(pid, 0);
 			disable_sleep_skip();
 		}
-		else if (g_config.ntdll_remap && ret == STATUS_IMAGE_NOT_AT_BASE && Win32Protect == PAGE_READONLY) {
+		else if (g_config.ntdll_remap && ret == STATUS_IMAGE_NOT_AT_BASE && Win32Protect == PAGE_READONLY)
 			prevent_module_reloading(BaseAddress);
-		}
 	}
-
-	if (ModuleName)
-		free(ModuleName);
 
 	return ret;
 }
@@ -836,7 +958,6 @@ HOOKDEF(HMODULE, WINAPI, LoadLibraryExW,
 	return ret;
 }
 
-// it's not safe to call pipe() in this hook until we replace all uses of snprintf in pipe()
 HOOKDEF(NTSTATUS, WINAPI, NtAllocateVirtualMemory,
 	__in	 HANDLE ProcessHandle,
 	__inout  PVOID *BaseAddress,
@@ -897,8 +1018,27 @@ HOOKDEF(NTSTATUS, WINAPI, NtReadVirtualMemory,
 	ENSURE_SIZET(NumberOfBytesRead);
 
 	ret = Old_NtReadVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToRead, NumberOfBytesRead);
+	DWORD pid = pid_from_process_handle(ProcessHandle);
 
-	LOQ_ntstatus("process", "pphB", "ProcessHandle", ProcessHandle, "BaseAddress", BaseAddress, "Size", NumberOfBytesToRead, "Buffer", NumberOfBytesRead, Buffer);
+	if (pid != GetCurrentProcessId()) {
+		LOQ_ntstatus(
+			"process", "piphB",
+			"ProcessHandle", ProcessHandle,
+			"ProcessId", pid,
+			"BaseAddress", BaseAddress,
+			"Size", NumberOfBytesToRead,
+			"Buffer", NumberOfBytesRead, Buffer
+		);
+	}
+	else {
+		LOQ_ntstatus(
+			"process", "pphB",
+			"ProcessHandle", ProcessHandle,
+			"BaseAddress", BaseAddress,
+			"Size", NumberOfBytesToRead,
+			"Buffer", NumberOfBytesRead, Buffer
+		);
+	}
 
 	return ret;
 }
@@ -914,8 +1054,28 @@ HOOKDEF(BOOL, WINAPI, ReadProcessMemory,
 	ENSURE_SIZET(lpNumberOfBytesRead);
 
 	ret = Old_ReadProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+	DWORD pid = pid_from_process_handle(hProcess);
 
-	LOQ_bool("process", "pphB", "ProcessHandle", hProcess, "BaseAddress", lpBaseAddress, "Size", nSize, "Buffer", lpNumberOfBytesRead, lpBuffer);
+	if (pid != GetCurrentProcessId()) {
+		LOQ_bool(
+			"process", "pphB",
+			"ProcessHandle", hProcess,
+			"BaseAddress", lpBaseAddress,
+			"Size", nSize,
+			"Buffer", lpNumberOfBytesRead, lpBuffer,
+			"ProcessId", pid
+		);
+	}
+	else {
+		LOQ_bool(
+			"process", "pphB",
+			"ProcessHandle", hProcess,
+			"BaseAddress", lpBaseAddress,
+			"Size", nSize,
+			"Buffer", lpNumberOfBytesRead, lpBuffer,
+			"ProcessId", pid
+		);
+	}
 
 	return ret;
 }
@@ -936,12 +1096,27 @@ HOOKDEF(NTSTATUS, WINAPI, NtWriteVirtualMemory,
 
 	pid = pid_from_process_handle(ProcessHandle);
 
-	LOQ_ntstatus("process", "ppBhs",
-		"ProcessHandle", ProcessHandle,
-		"BaseAddress", BaseAddress,
-		"Buffer", NumberOfBytesWritten, Buffer,
-		"BufferLength", is_valid_address_range((ULONG_PTR)NumberOfBytesWritten, 4) ? *NumberOfBytesWritten : 0,
-		"StackPivoted", is_stack_pivoted() ? "yes" : "no");
+	if (pid != GetCurrentProcessId()) {
+		LOQ_ntstatus(
+			"process", "pipBhs",
+			"ProcessHandle", ProcessHandle,
+			"ProcessId", pid,
+			"BaseAddress", BaseAddress,
+			"Buffer", NumberOfBytesWritten, Buffer,
+			"BufferLength", is_valid_address_range((ULONG_PTR)NumberOfBytesWritten, 4) ? *NumberOfBytesWritten : 0,
+			"StackPivoted", is_stack_pivoted() ? "yes" : "no"
+		);
+	}
+	else {
+		LOQ_ntstatus(
+			"process", "ppBhs",
+			"ProcessHandle", ProcessHandle,
+			"BaseAddress", BaseAddress,
+			"Buffer", NumberOfBytesWritten, Buffer,
+			"BufferLength", is_valid_address_range((ULONG_PTR)NumberOfBytesWritten, 4) ? *NumberOfBytesWritten : 0,
+			"StackPivoted", is_stack_pivoted() ? "yes" : "no"
+		);
+	}
 
 	if (pid != GetCurrentProcessId() && NT_SUCCESS(ret)) {
 		if (g_config.injection)
@@ -969,8 +1144,27 @@ HOOKDEF(BOOL, WINAPI, WriteProcessMemory,
 
 	pid = pid_from_process_handle(hProcess);
 
-	LOQ_bool("process", "ppBhs", "ProcessHandle", hProcess, "BaseAddress", lpBaseAddress,
-		"Buffer", lpNumberOfBytesWritten, lpBuffer, "BufferLength", *lpNumberOfBytesWritten, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
+	if (pid != GetCurrentProcessId()) {
+		LOQ_bool(
+			"process", "pipBhs",
+			"ProcessHandle", hProcess,
+			"ProcessId", pid,
+			"BaseAddress", lpBaseAddress,
+			"Buffer", lpNumberOfBytesWritten, lpBuffer,
+			"BufferLength", *lpNumberOfBytesWritten,
+			"StackPivoted", is_stack_pivoted() ? "yes" : "no"
+		);
+	}
+	else {
+		LOQ_bool(
+			"process", "ppBhs",
+			"ProcessHandle", hProcess,
+			"BaseAddress", lpBaseAddress,
+			"Buffer", lpNumberOfBytesWritten, lpBuffer,
+			"BufferLength", *lpNumberOfBytesWritten,
+			"StackPivoted", is_stack_pivoted() ? "yes" : "no"
+		);
+	}
 
 	if (pid != GetCurrentProcessId() && ret) {
 		if (g_config.injection)
@@ -1047,18 +1241,21 @@ HOOKDEF(NTSTATUS, WINAPI, NtProtectVirtualMemory,
 	NTSTATUS ret;
 	MEMORY_BASIC_INFORMATION meminfo;
 	DWORD OriginalNewAccessProtection = 0;
-	unsigned int DllRVA;
-	char *ModuleName = NULL;
+	UNICODE_STRING *module_name = NULL;
 	if (BaseAddress)
-		ModuleName = convert_address_to_dll_name_and_offset((ULONG_PTR)*BaseAddress, &DllRVA);
+		module_name = get_module_name((ULONG_PTR)*BaseAddress);
 
-	if (g_config.ntdll_protect && NewAccessProtection == PAGE_EXECUTE_READWRITE && BaseAddress && NumberOfBytesToProtect &&
-			NtCurrentProcess() == ProcessHandle && is_in_dll_range((ULONG_PTR)*BaseAddress) &&
-			ModuleName && !strcmp(ModuleName, "ntdll.dll")) {
-				// don't allow writes, this will cause memory access violations
-				// that we are going to handle in the RtlDispatchException hook
+	if (module_name && g_config.ntdll_protect || g_config.hook_protect) {
+		if (NewAccessProtection == PAGE_EXECUTE_READWRITE && BaseAddress && NumberOfBytesToProtect &&
+			NtCurrentProcess() == ProcessHandle && is_in_dll_range((ULONG_PTR)*BaseAddress)) {
+			if ((g_config.ntdll_protect && module_name->Length && !wcsncmp(module_name->Buffer, L"ntdll.dll", module_name->Length)) ||
+				(g_config.hook_protect && dll_is_hooked(module_name->Buffer))) {
+				// don't allow writes, this will cause memory access violations that are handled in the RtlDispatchException hook
 				OriginalNewAccessProtection = NewAccessProtection;
 				NewAccessProtection = PAGE_EXECUTE_READ;
+				DebugOutput("NtProtectVirtualMemory: Protecting %wZ at 0x%p", module_name, *BaseAddress);
+			}
+		}
 	}
 
 	memset(&meminfo, 0, sizeof(meminfo));
@@ -1103,17 +1300,14 @@ HOOKDEF(NTSTATUS, WINAPI, NtProtectVirtualMemory,
 			"NewAccessProtection", NewAccessProtection,
 			"OldAccessProtection", OldAccessProtection, "StackPivoted", is_stack_pivoted() ? "yes" : "no", "IsStack", "yes");
 	}
-	else if (ModuleName)
-		LOQ_ntstatus("process", "pPsPhhHs", "ProcessHandle", ProcessHandle, "BaseAddress", BaseAddress, "ModuleName", ModuleName,
+	else if (module_name)
+		LOQ_ntstatus("process", "pPoPhhHs", "ProcessHandle", ProcessHandle, "BaseAddress", BaseAddress, "ModuleName", module_name,
 			"NumberOfBytesProtected", NumberOfBytesToProtect, "MemoryType", meminfo.Type, "NewAccessProtection", NewAccessProtection,
 			"OldAccessProtection", OldAccessProtection, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
 	else
 		LOQ_ntstatus("process", "pPPhhHs", "ProcessHandle", ProcessHandle, "BaseAddress", BaseAddress,
 			"NumberOfBytesProtected", NumberOfBytesToProtect, "MemoryType", meminfo.Type, "NewAccessProtection", NewAccessProtection,
 			"OldAccessProtection", OldAccessProtection, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
-
-	if (ModuleName)
-		free(ModuleName);
 
 	return ret;
 }
@@ -1128,17 +1322,19 @@ HOOKDEF(BOOL, WINAPI, VirtualProtectEx,
 	BOOL ret;
 	MEMORY_BASIC_INFORMATION meminfo;
 	DWORD OriginalNewProtect = 0;
-	unsigned int DllRVA;
-	char *ModuleName = NULL;
-	ModuleName = convert_address_to_dll_name_and_offset((ULONG_PTR)lpAddress, &DllRVA);
+	UNICODE_STRING *module_name = get_module_name((ULONG_PTR)lpAddress);
 
-	if (g_config.ntdll_protect && flNewProtect == PAGE_EXECUTE_READWRITE && lpAddress && dwSize &&
-			NtCurrentProcess() == hProcess && is_in_dll_range((ULONG_PTR)lpAddress) &&
-			ModuleName && !strcmp(ModuleName, "ntdll.dll")) {
-				// don't allow writes, this will cause memory access violations
-				// that we are going to handle in the RtlDispatchException hook
+	if (module_name && g_config.ntdll_protect || g_config.hook_protect) {
+		if (flNewProtect == PAGE_EXECUTE_READWRITE && lpAddress && dwSize &&
+			GetCurrentProcessId() == our_getprocessid(hProcess) && is_in_dll_range((ULONG_PTR)lpAddress)) {
+			if ((g_config.ntdll_protect && module_name->Length && !wcsncmp(module_name->Buffer, L"ntdll.dll", module_name->Length)) ||
+				(g_config.hook_protect && dll_is_hooked(module_name->Buffer))) {
+				// don't allow writes, this will cause memory access violations that are handled in the RtlDispatchException hook
 				OriginalNewProtect = flNewProtect;
 				flNewProtect = PAGE_EXECUTE_READ;
+				DebugOutput("VirtualProtectEx: Protecting %wZ at 0x%p", module_name, lpAddress);
+			}
+		}
 	}
 
 	memset(&meminfo, 0, sizeof(meminfo));
@@ -1182,21 +1378,17 @@ HOOKDEF(BOOL, WINAPI, VirtualProtectEx,
 		LOQ_bool("process", "ppphhHss", "ProcessHandle", hProcess, "Address", lpAddress,
 			"Size", dwSize, "MemType", meminfo.Type, "Protection", flNewProtect, "OldProtection", lpflOldProtect, "StackPivoted", is_stack_pivoted() ? "yes" : "no", "IsStack", "yes");
 	}
-	else if (ModuleName)
-		LOQ_bool("process", "ppsphhHs", "ProcessHandle", hProcess, "Address", lpAddress, "ModuleName", ModuleName, 
+	else if (module_name)
+		LOQ_bool("process", "ppophhHs", "ProcessHandle", hProcess, "Address", lpAddress, "ModuleName", module_name, 
 			"Size", dwSize, "MemType", meminfo.Type, "Protection", flNewProtect, "OldProtection", lpflOldProtect,
 			"StackPivoted", is_stack_pivoted() ? "yes" : "no");
 	else
 		LOQ_bool("process", "ppphhHs", "ProcessHandle", hProcess, "Address", lpAddress, "Size", dwSize, "MemType", meminfo.Type, 
 			"Protection", flNewProtect, "OldProtection", lpflOldProtect, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
 
-	if (ModuleName)
-		free(ModuleName);
-
 	return ret;
 }
 
-// it's not safe to call pipe() in this hook until we replace all uses of snprintf in pipe()
 HOOKDEF(NTSTATUS, WINAPI, NtFreeVirtualMemory,
 	IN	  HANDLE ProcessHandle,
 	IN	  PVOID *BaseAddress,
@@ -1293,13 +1485,16 @@ HOOKDEF_NOTAIL(WINAPI, RtlDispatchException,
 	if (ExceptionRecord && (ULONG_PTR)ExceptionRecord->ExceptionAddress >= g_our_dll_base && (ULONG_PTR)ExceptionRecord->ExceptionAddress < (g_our_dll_base + g_our_dll_size)) {
 		if (!(g_config.debugger && ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP)) {
 			char buf[160];
-			ULONG_PTR seh = 0;
-			DWORD *tebtmp = (DWORD *)NtCurrentTeb();
-			if (tebtmp[0] != 0xffffffff)
-				seh = ((DWORD*)(DWORD_PTR)tebtmp[0])[1];
-			if (seh < g_our_dll_base || seh >= (g_our_dll_base + g_our_dll_size)) {
-				_snprintf(buf, sizeof(buf), "Exception 0x%x reported at offset 0x%x in capemon itself while accessing 0x%p from hook %s", ExceptionRecord->ExceptionCode, (DWORD)((ULONG_PTR)ExceptionRecord->ExceptionAddress - g_our_dll_base), (PVOID)ExceptionRecord->ExceptionInformation[1], hook_info()->current_hook ? hook_info()->current_hook->funcname : "unknown");
-				log_anomaly("capemon crash", buf);
+			PTEB Teb = NtCurrentTeb();
+			if (Teb) {
+				PEXCEPTION_REGISTRATION_RECORD SehRecord = Teb->NtTib.ExceptionList;
+				if (SehRecord && SehRecord != EXCEPTION_CHAIN_END) {
+					ULONG_PTR HandlerAddress = (ULONG_PTR)SehRecord->Handler;
+					if (HandlerAddress < g_our_dll_base || HandlerAddress >= (g_our_dll_base + g_our_dll_size)) {
+						_snprintf(buf, sizeof(buf), "Exception 0x%x reported at offset 0x%x in capemon itself while accessing 0x%p from hook %s", ExceptionRecord->ExceptionCode, (DWORD)((ULONG_PTR)ExceptionRecord->ExceptionAddress - g_our_dll_base), (PVOID)ExceptionRecord->ExceptionInformation[1], hook_info()->current_hook ? hook_info()->current_hook->funcname : "unknown");
+						log_anomaly("capemon crash", buf);
+					}
+				}
 			}
 		}
 	}
@@ -1320,21 +1515,21 @@ HOOKDEF_ALT(BOOL, WINAPI, RtlDispatchException,
 	if (g_config.log_exceptions > 1 && ExceptionRecord && ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
 		mini_handler(&ExceptionInfo);
 
-	if (g_config.ntdll_protect) {
+	if (g_config.ntdll_protect || g_config.hook_protect) {
 		if (ExceptionRecord && ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ExceptionRecord->ExceptionFlags == 0 &&
 			ExceptionRecord->NumberParameters == 2 && ExceptionRecord->ExceptionInformation[0] == 1) {
-			unsigned int offset;
-			char *dllname = convert_address_to_dll_name_and_offset(ExceptionRecord->ExceptionInformation[1], &offset);
-			if (dllname && !strcmp(dllname, "ntdll.dll")) {
-				// if trying to write to ntdll.dll, then just skip the instruction
+			UNICODE_STRING *module_name = get_module_name((ULONG_PTR)ExceptionRecord->ExceptionInformation[1]);
+			if ((g_config.ntdll_protect && module_name && module_name->Length && !wcsncmp(module_name->Buffer, L"ntdll.dll", module_name->Length)) ||
+				(g_config.hook_protect && module_name && dll_is_hooked(module_name->Buffer))) {
+				// if trying to write to protected module, skip the instruction
 				if (!ntdll_protect_logged) {
 					ntdll_protect_logged = TRUE;
 #ifdef _WIN64
-					DebugOutput("RtlDispatchException: skipped instruction at 0x%p writing to ntdll (0x%p - 0x%p)\n", Context->Rip, ExceptionRecord->ExceptionInformation[1], offset);
+					DebugOutput("RtlDispatchException: skipped instruction at 0x%p writing to %wZ (0x%p)\n", Context->Rip, module_name, ExceptionRecord->ExceptionInformation[1]);
 				}
 				Context->Rip += lde((void*)Context->Rip);
 #else
-					DebugOutput("RtlDispatchException: skipped instruction at 0x%x writing to ntdll (0x%x - 0x%x)\n", Context->Eip, ExceptionRecord->ExceptionInformation[1], offset);
+					DebugOutput("RtlDispatchException: skipped instruction at 0x%x writing to %wZ (0x%x)\n", Context->Eip, module_name, ExceptionRecord->ExceptionInformation[1]);
 				}
 				Context->Eip += lde((void*)Context->Eip);
 #endif
@@ -1343,8 +1538,6 @@ HOOKDEF_ALT(BOOL, WINAPI, RtlDispatchException,
 					LOQ_void("system", "pppp", "ExceptionCode", ExceptionRecord->ExceptionCode, "ExceptionAddress", ExceptionRecord->ExceptionAddress, "ExceptionFlags", ExceptionRecord->ExceptionFlags, "ExceptionInformation", ExceptionRecord->ExceptionInformation[0]);
 				return TRUE;
 			}
-			if (dllname)
-				free(dllname);
 		}
 	}
 

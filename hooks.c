@@ -19,8 +19,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "misc.h"
 #include "hooking.h"
 #include "hooks.h"
+#include "CAPE\CAPE.h"
 
+typedef struct
+{
+	PCHAR FunctionName;
+	PVOID Address;
+} NameByAddress;
+
+extern NameByAddress* GetAddressesByYara(HMODULE ModuleBase, PCHAR FunctionNames[], SIZE_T FunctionCount, SIZE_T* OutFoundCount);
 extern VOID CALLBACK New_DllLoadNotification(ULONG NotificationReason, const PLDR_DLL_NOTIFICATION_DATA NotificationData, PVOID Context);
+extern PVOID GetAddressByYara(HMODULE ModuleBase, PCHAR FunctionName);
 extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 extern void ErrorOutput(_In_ LPCTSTR lpOutputString, ...);
 extern DWORD GetTimeStamp(LPVOID Address);
@@ -38,6 +47,9 @@ void disable_tail_call_optimization(void)
 #define HOOK(library, funcname) {L###library, #funcname, NULL, NULL, \
 	&New_##funcname, (void **) &Old_##funcname, NULL, FALSE, FALSE, 0, FALSE}
 
+#define HOOK_WITHNAME(library, funcname, mangled) {L###library, mangled, NULL, NULL, \
+    &New_##funcname, (void **) &Old_##funcname, NULL, FALSE, FALSE, 0, FALSE}
+
 #define HOOK_SPECIAL(library, funcname) {L###library, #funcname, NULL, NULL, \
 	&New_##funcname, (void **) &Old_##funcname, NULL, TRUE, FALSE, 0, FALSE}
 
@@ -53,15 +65,41 @@ void disable_tail_call_optimization(void)
 #define HOOK_FUNCRVA(library, funcname, timestamp, rva) {L###library, #funcname, NULL, NULL, \
 	&New_##funcname, (void **) &Old_##funcname, NULL, FALSE, FALSE, 0, FALSE, timestamp, rva}
 
-hook_t full_hooks[] = {
+#define HOOK_EXE(funcname) {NULL, #funcname, NULL, NULL, \
+	&New_##funcname, (void **) &Old_##funcname, NULL, FALSE, FALSE, 0, FALSE}
 
+#define HOOK_EXERVA(funcname, timestamp, rva) {NULL, #funcname, NULL, NULL, \
+	&New_##funcname, (void **) &Old_##funcname, NULL, FALSE, FALSE, 0, FALSE, timestamp, rva}
+
+#define HOOK_COM(moniker) {NULL, #moniker, NULL, NULL, \
+    &New_##moniker, (void **) &Old_##moniker, NULL, FALSE, FALSE, 0, FALSE, 0, FALSE}
+
+#define HOOK_COM_WITHNAME(friendlyname, funcname) {NULL, #funcname, NULL, NULL, \
+    &New_##friendlyname, (void **) &Old_##friendlyname, NULL, FALSE, FALSE, 0, FALSE, 0, FALSE}
+
+
+com_hook_t g_com_hooks[] = {
+	{ HOOK_COM(WbemLocator_ConnectServer), &CLSID_WbemLocator, &IID_IWbemLocator },
+	{ HOOK_COM_WITHNAME(WMI_ExecQuery, IWbemServices_ExecQuery), NULL, NULL },
+	{ HOOK_COM_WITHNAME(WMI_ExecQueryAsync, IWbemServices_ExecQueryAsync), NULL, NULL },
+	{ HOOK_COM_WITHNAME(WMI_CreateInstanceEnum, IWbemServices_CreateInstanceEnum), NULL, NULL },
+	{ HOOK_COM_WITHNAME(WMI_CreateInstanceEnumAsync, IWbemServices_CreateInstanceEnumAsync), NULL, NULL },
+	{ HOOK_COM_WITHNAME(WMI_GetObject, IWbemServices_GetObjectW), NULL, NULL },
+	{ HOOK_COM_WITHNAME(WMI_GetObjectAsync, IWbemServices_GetObjectAsync), NULL, NULL },
+	{ HOOK_COM_WITHNAME(WMI_ExecMethod, IWbemServices_ExecMethod), NULL, NULL },
+	{ HOOK_COM_WITHNAME(WMI_ExecMethodAsync, IWbemServices_ExecMethodAsync), NULL, NULL },
+};
+
+hook_t full_hooks[] = {
 	// Process Hooks
 	HOOK_NOTAIL_ALT(ntdll, RtlDispatchException, 2),
 	HOOK_NOTAIL(ntdll, NtRaiseException, 3),
+
 	HOOK_NOTAIL_ALT(ntdll, LdrLoadDll, 4),
 	HOOK_NOTAIL(ntdll, LdrUnloadDll, 1),
 	HOOK_SPECIAL(ntdll, NtCreateUserProcess),
 	HOOK_SPECIAL(kernel32, CreateProcessInternalW),
+
 	HOOK(ntdll, LdrpCallInitRoutine),
 	HOOK(ntdll, NtAllocateVirtualMemory),
 	HOOK(ntdll, NtAllocateVirtualMemoryEx),
@@ -91,6 +129,7 @@ hook_t full_hooks[] = {
 	HOOK(ntdll, NtUnmapViewOfSection),
 	HOOK(ntdll, NtUnmapViewOfSectionEx),
 	HOOK(ntdll, NtOpenProcessToken),
+	HOOK(ntdll, NtAdjustPrivilegesToken),
 	HOOK(ntdll, NtQueryInformationToken),
 	HOOK(kernel32, WaitForDebugEvent),
 	HOOK(ntdll, DbgUiWaitStateChange),
@@ -101,6 +140,11 @@ hook_t full_hooks[] = {
 	HOOK(kernel32, Process32NextW),
 	HOOK(kernel32, Module32FirstW),
 	HOOK(kernel32, Module32NextW),
+	HOOK(kernel32, Thread32First),
+	HOOK(kernel32, Thread32Next),
+	HOOK(kernelbase, K32EnumProcesses),
+	HOOK(wtsapi32, WTSEnumerateProcessesW),
+	HOOK(wtsapi32, WTSEnumerateProcessesExW),
 	HOOK(kernel32, CreateProcessA),
 	HOOK(kernel32, CreateProcessW),
 	HOOK(kernel32, WinExec),
@@ -109,6 +153,7 @@ hook_t full_hooks[] = {
 	// all variants of ShellExecute end up in ShellExecuteExW
 	HOOK(shell32, ShellExecuteExW),
 	HOOK(msvcrt, system),
+	HOOK(ntdll, vDbgPrintExWithPrefixInternal),
 
 	// Thread Hooks
 	HOOK_SPECIAL(ntdll, NtCreateThread),
@@ -118,8 +163,12 @@ hook_t full_hooks[] = {
 	HOOK(ntdll, NtQueueApcThreadEx),
 	HOOK(ntdll, NtOpenThread),
 	HOOK(ntdll, NtGetContextThread),
-	HOOK(ntdll, RtlWow64GetThreadContext),
 	HOOK(ntdll, NtSetContextThread),
+	HOOK_NOTAIL(ntdll, RtlUserThreadStart, 2),
+#ifdef _WIN64
+	HOOK(ntdll, RtlWow64GetThreadContext),
+	HOOK(ntdll, RtlWow64SetThreadContext),
+#endif
 	HOOK(ntdll, NtSuspendThread),
 	HOOK(ntdll, NtResumeThread),
 	HOOK(ntdll, NtAlertResumeThread),
@@ -130,6 +179,8 @@ hook_t full_hooks[] = {
 	HOOK(ntdll, NtContinue),
 	HOOK(ntdll, NtContinueEx),
 	HOOK(ntdll, NtTestAlert),
+	HOOK(kernelbase, SetThreadStackGuarantee),
+	HOOK(kernelbase, SetThreadDescription),
 	HOOK(kernel32, CreateThread),
 	HOOK(kernel32, CreateRemoteThread),
 	HOOK(kernel32, CreateRemoteThreadEx),
@@ -155,6 +206,15 @@ hook_t full_hooks[] = {
 	HOOK_SPECIAL(combase, CoGetClassObject),
 	HOOK_SPECIAL(combase, CoGetObject),
 
+	// WMI Hooks
+#ifdef _WIN64
+	HOOK_WITHNAME(fastprox, WMI_Get, "?Get@CWbemObject@@UEAAJPEBGJPEAUtagVARIANT@@PEAJ2@Z"),
+	HOOK_WITHNAME(fastprox, WMI_Next, "?Next@CWbemObject@@UEAAJJPEAPEAGPEAUtagVARIANT@@PEAJ2@Z"),
+#else
+	HOOK_WITHNAME(fastprox, WMI_Get, "?Get@CWbemObject@@UAGJPBGJPAUtagVARIANT@@PAJ2@Z"),
+	HOOK_WITHNAME(fastprox, WMI_Next, "?Next@CWbemObject@@UAGJJPAPAGPAUtagVARIANT@@PAJ2@Z"),
+#endif
+
 	// File Hooks
 	HOOK(ntdll, NtQueryAttributesFile),
 	HOOK(ntdll, NtQueryFullAttributesFile),
@@ -166,6 +226,7 @@ hook_t full_hooks[] = {
 	HOOK(ntdll, NtDeviceIoControlFile),
 	HOOK(ntdll, NtQueryDirectoryFile),
 	HOOK(ntdll, NtQueryInformationFile),
+	HOOK(ntdll, NtQueryVolumeInformationFile),
 	HOOK(ntdll, NtSetInformationFile),
 	HOOK(ntdll, NtOpenDirectoryObject),
 	HOOK(ntdll, NtCreateDirectoryObject),
@@ -194,6 +255,9 @@ hook_t full_hooks[] = {
 	HOOK(kernel32, GetDiskFreeSpaceW),
 	HOOK(kernel32, GetVolumeNameForVolumeMountPointW),
 	HOOK(kernel32, GetVolumeInformationByHandleW),
+	HOOK(kernel32, GetVolumeInformationA),
+	HOOK(kernel32, GetVolumeInformationW),
+	HOOK(kernel32, SetFileInformationByHandle),
 	HOOK(shell32, SHGetFolderPathW),
 	HOOK(shell32, SHGetKnownFolderPath),
 	HOOK(shell32, SHGetFileInfoW),
@@ -209,7 +273,7 @@ hook_t full_hooks[] = {
 	HOOK(rstrtmgr, RmStartSession),
 
 	// Registry Hooks
-	// Note: Most, if not all, of the Registry API go natively from both the 'A' as well as 
+	// Note: Most, if not all, of the Registry API go natively from both the 'A' as well as
 	// the 'W' versions. So we have to hook all the ascii *and* unicode APIs of those functions.
 	HOOK(advapi32, RegOpenKeyExA),
 	HOOK(advapi32, RegOpenKeyExW),
@@ -298,6 +362,8 @@ hook_t full_hooks[] = {
 	HOOK(user32, SetWindowLongPtrW),
 	HOOK(user32, EnumDisplayDevicesA),
 	HOOK(user32, EnumDisplayDevicesW),
+	HOOK(msi, MsiInstallProductA),
+	HOOK(msi, MsiInstallProductW),
 //	HOOK_NOTAIL(user32, CreateWindowExA, 12),	// maldoc detonation issues
 //	HOOK_NOTAIL(user32, CreateWindowExW, 12),	//
 //	HOOK(user32, EnumWindows),	// Disable for now, invokes a user-specified callback that can contain
@@ -320,13 +386,10 @@ hook_t full_hooks[] = {
 	HOOK(ntdll, NtQueryInformationAtom),
 
 	// Misc Hooks
-#ifndef _WIN64
-	HOOK(ntdll, memcpy),
-#endif
-	HOOK(msvcrt, memcpy),
 	//HOOK(ntdll, RtlMoveMemory),
 	HOOK(kernel32, GetCommandLineA),
 	HOOK(kernel32, GetCommandLineW),
+	HOOK(shcore, CommandLineToArgvW),
 	HOOK(kernel32, OutputDebugStringA),
 	HOOK(kernel32, OutputDebugStringW),
 	HOOK(kernel32, HeapCreate),
@@ -336,12 +399,17 @@ hook_t full_hooks[] = {
 	HOOK(user32, SetWindowsHookExW),
 	HOOK(user32, UnhookWindowsHookEx),
 	HOOK(kernel32, SetUnhandledExceptionFilter),
+	HOOK(kernel32, UnhandledExceptionFilter),
 	HOOK(ntdll, RtlAddVectoredExceptionHandler),
+	HOOK(ntdll, RtlRemoveVectoredExceptionHandler),
 	HOOK(kernel32, SetErrorMode),
 	HOOK(ntdll, LdrGetDllHandle),
+	HOOK(ntdll, LdrGetDllHandleEx),
 	HOOK(ntdll, LdrGetProcedureAddress),
 	HOOK(ntdll, LdrGetProcedureAddressForCaller),
 	HOOK(kernel32, DeviceIoControl),
+	HOOK(kernel32, GetSystemFirmwareTable),
+	HOOK(kernel32, EnumSystemFirmwareTables),
 	HOOK_NOTAIL(ntdll, NtShutdownSystem, 1),
 	HOOK_NOTAIL(ntdll, NtSetSystemPowerState, 3),
 	HOOK_NOTAIL(user32, ExitWindowsEx, 2),
@@ -388,6 +456,7 @@ hook_t full_hooks[] = {
 	//HOOK(ole32, OleConvertOLESTREAMToIStorage),
 	HOOK(kernel32, GlobalMemoryStatus),
 	HOOK(kernel32, GlobalMemoryStatusEx),
+	HOOK(kernel32, GetPhysicallyInstalledSystemMemory),
 	HOOK(user32, SystemParametersInfoA),
 	HOOK(user32, SystemParametersInfoW),
 	HOOK(pstorec, PStoreCreateInstance),
@@ -397,6 +466,7 @@ hook_t full_hooks[] = {
 	HOOK(oleaut32, VarBstrCat),
 	HOOK_NOTAIL(usp10, ScriptIsComplex, 3),
 	HOOK_NOTAIL(inseng,DownloadFile,3),
+	HOOK(imagehlp, MapFileAndCheckSumA),
 #ifndef _WIN64
 	HOOK(ntdll, RtlDosPathNameToNtPathName_U),
 	HOOK(ntdll, NtQueryLicenseValue),
@@ -405,6 +475,12 @@ hook_t full_hooks[] = {
 	HOOK(shlwapi, UrlCanonicalizeW),
 	HOOK_NOTAIL(vbe7, rtcCreateObject2, 3),
 #endif
+	HOOK(ntdll, NtPowerInformation),
+
+	HOOK(cmd, FindFixAndRun),
+	HOOK(User32, GetClipboardData),
+	HOOK(User32, OpenClipboard),
+	HOOK(User32, SetClipboardData),
 
 	// Language related hooks
 	HOOK(ntdll, NtQueryDefaultUILanguage),
@@ -491,7 +567,11 @@ hook_t full_hooks[] = {
 	HOOK(ncrypt, SslDecryptPacket),
 	HOOK(iphlpapi, GetAdaptersAddresses),
 	HOOK(iphlpapi, GetAdaptersInfo),
+	HOOK(iphlpapi, IcmpSendEcho),
+	HOOK(iphlpapi, IcmpSendEcho2),
 	HOOK(urlmon, CoInternetSetFeatureEnabled),
+	HOOK(ole32, MkParseDisplayName),
+	HOOK(urlmon, MkParseDisplayNameEx),
 
 	// Service Hooks
 	HOOK(advapi32, OpenSCManagerA),
@@ -515,10 +595,38 @@ hook_t full_hooks[] = {
 	HOOK(sechost, ControlService),
 	HOOK(sechost, DeleteService),
 
+	// Trace Hooks
+	HOOK(sechost, CloseTrace),
+	HOOK(sechost, ControlTraceA),
+	HOOK(sechost, ControlTraceW),
+	HOOK(advapi32, EnableTrace),
+	HOOK(advapi32, EnableTraceEx),
+	HOOK(sechost, EnableTraceEx2),
+	HOOK(sechost, OpenTraceA),
+	HOOK(sechost, OpenTraceW),
+	HOOK(sechost, QueryAllTracesA),
+	HOOK(sechost, QueryAllTracesW),
+	HOOK(advapi32, QueryTraceA),
+	HOOK(advapi32, QueryTraceW),
+	HOOK(sechost, StartTraceA),
+	HOOK(sechost, StartTraceW),
+	HOOK(sechost, StopTraceA),
+	HOOK(sechost, StopTraceW),
+	HOOK(advapi32, UpdateTraceA),
+	HOOK(advapi32, UpdateTraceW),
+	HOOK(advapi32, CveEventWrite),
+	HOOK(sechost, EventAccessControl),
+	HOOK(advapi32, EventAccessQuery),
+	HOOK(sechost, EventAccessRemove),
+	HOOK(advapi32, EventRegister),
+	HOOK(advapi32, EventSetInformation),
+	HOOK(advapi32, EventUnregister),
+
 	// Sleep Hooks
 	HOOK(ntdll, NtQueryPerformanceCounter),
 	HOOK(ntdll, NtDelayExecution),
 	HOOK(ntdll, NtWaitForSingleObject),
+	HOOK(ntdll, NtWaitForMultipleObjects),
 	HOOK_SPECIAL(kernel32, GetLocalTime),
 	HOOK_SPECIAL(kernel32, GetSystemTime),
 	HOOK_SPECIAL(kernel32, GetSystemTimeAsFileTime),
@@ -572,10 +680,24 @@ hook_t full_hooks[] = {
 	// Crypto Functions
 	HOOK(advapi32, CryptAcquireContextA),
 	HOOK(advapi32, CryptAcquireContextW),
+
+	// DPAPI
+	HOOK(crypt32, CryptProtectData),
+	HOOK(crypt32, CryptUnprotectData),
+	HOOK(crypt32, CryptProtectMemory),
+	HOOK(crypt32, CryptUnprotectMemory),
+
+	// Legacy DPAPI
 	HOOK(advapi32, CryptProtectData),
 	HOOK(advapi32, CryptUnprotectData),
 	HOOK(advapi32, CryptProtectMemory),
 	HOOK(advapi32, CryptUnprotectMemory),
+	HOOK(cryptsp, CryptProtectData),
+	HOOK(cryptsp, CryptUnprotectData),
+	HOOK(cryptsp, CryptProtectMemory),
+	HOOK(cryptsp, CryptUnprotectMemory),
+
+	// General CryptoAPI
 	HOOK(advapi32, CryptDecrypt),
 	HOOK(advapi32, CryptEncrypt),
 	HOOK(advapi32, CryptHashData),
@@ -586,6 +708,7 @@ hook_t full_hooks[] = {
 	HOOK(advapi32, CryptDeriveKey),
 	HOOK(advapi32, CryptExportKey),
 	HOOK(advapi32, CryptDestroyKey),
+	HOOK(advapi32, CryptDuplicateKey),
 	HOOK(advapi32, CryptGenKey),
 	HOOK(advapi32, CryptCreateHash),
 	HOOK(advapi32, CryptDestroyHash),
@@ -594,24 +717,49 @@ hook_t full_hooks[] = {
 	HOOK(advapi32, QueryUsersOnEncryptedFile),
 	HOOK(advapi32, CryptGenRandom),
 	HOOK(advapi32, CryptImportKey),
-	HOOK(wintrust, HTTPSCertificateTrust),
-	HOOK(wintrust, HTTPSFinalProv),
+	HOOK(advapi32, CryptHashSessionKey),
+
+	// crypt32 additional
 	HOOK(crypt32, CryptDecodeObjectEx),
 	HOOK(crypt32, CryptImportPublicKeyInfo),
-	HOOK(ncrypt, NCryptImportKey),
-	HOOK(ncrypt, NCryptDecrypt),
-	HOOK(ncrypt, NCryptEncrypt),
+	HOOK(crypt32, CryptEncryptMessage),
+	HOOK(crypt32, CryptDecryptMessage),
+	HOOK(crypt32, CryptHashMessage),
+	HOOK(crypt32, CryptSignMessage),
+	HOOK(crypt32, CryptVerifyMessageSignature),
+
+	// CNG
 	HOOK(bcrypt, BCryptImportKey),
 	HOOK(bcrypt, BCryptImportKeyPair),
 	HOOK(bcrypt, BCryptDecrypt),
 	HOOK(bcrypt, BCryptEncrypt),
-	// needed due to the DLL being delay-loaded in some cases
+	HOOK(bcrypt, BCryptDeriveKey),
+	HOOK(bcrypt, BCryptKeyDerivation),
+	HOOK(bcrypt, BCryptHashData),
+	HOOK(bcrypt, BCryptCreateHash),
+	HOOK(bcrypt, BCryptDestroyHash),
+	HOOK(bcrypt, BCryptGenRandom),
+	HOOK(bcrypt, BCryptOpenAlgorithmProvider),
+	HOOK(bcrypt, BCryptCloseAlgorithmProvider),
+
+	HOOK(ncrypt, NCryptImportKey),
+	HOOK(ncrypt, NCryptDecrypt),
+	HOOK(ncrypt, NCryptEncrypt),
+	HOOK(ncrypt, NCryptCreatePersistedKey),
+	HOOK(ncrypt, NCryptFinalizeKey),
+	HOOK(ncrypt, NCryptOpenKey),
+	HOOK(cryptbase, SystemFunction036),
+	HOOK(cryptbase, SystemFunction040),
+	HOOK(cryptbase, SystemFunction041),
+
+	// wintrust
+	HOOK(wintrust, HTTPSCertificateTrust),
+	HOOK(wintrust, HTTPSFinalProv),
+	HOOK(wintrust, WTGetSignatureInfo),
+
+	// Delay-loaded
 	HOOK(cryptsp, CryptAcquireContextA),
 	HOOK(cryptsp, CryptAcquireContextW),
-	HOOK(cryptsp, CryptProtectData),
-	HOOK(cryptsp, CryptUnprotectData),
-	HOOK(cryptsp, CryptProtectMemory),
-	HOOK(cryptsp, CryptUnprotectMemory),
 	HOOK(cryptsp, CryptDecrypt),
 	HOOK(cryptsp, CryptEncrypt),
 	HOOK(cryptsp, CryptHashData),
@@ -619,9 +767,13 @@ hook_t full_hooks[] = {
 	HOOK(cryptsp, CryptDecryptMessage),
 	HOOK(cryptsp, CryptEncryptMessage),
 	HOOK(cryptsp, CryptHashMessage),
+	HOOK(cryptsp, CryptDeriveKey),
 	HOOK(cryptsp, CryptExportKey),
+	HOOK(cryptsp, CryptDestroyKey),
+	HOOK(cryptsp, CryptDuplicateKey),
 	HOOK(cryptsp, CryptGenKey),
 	HOOK(cryptsp, CryptCreateHash),
+	HOOK(cryptsp, CryptDestroyHash),
 	HOOK(cryptsp, CryptEnumProvidersA),
 	HOOK(cryptsp, CryptEnumProvidersW),
 	HOOK(cryptsp, CryptHashSessionKey),
@@ -742,27 +894,162 @@ hook_t full_hooks[] = {
 	HOOK_SPECIAL(vbscript, VbsPrint),
 };
 
+hook_t native_hooks[] = {
+
+	HOOK_NOTAIL_ALT(ntdll, RtlDispatchException, 2),
+	HOOK_NOTAIL(ntdll, NtRaiseException, 3),
+	HOOK_NOTAIL_ALT(ntdll, LdrLoadDll, 4),
+	HOOK_NOTAIL(ntdll, LdrUnloadDll, 1),
+	HOOK_SPECIAL(ntdll, NtCreateUserProcess),
+
+	// File Hooks
+	HOOK(ntdll, NtQueryAttributesFile),
+	HOOK(ntdll, NtQueryFullAttributesFile),
+	HOOK(ntdll, NtCreateFile),
+	HOOK(ntdll, NtOpenFile),
+	HOOK(ntdll, NtReadFile),
+	HOOK(ntdll, NtWriteFile),
+	HOOK(ntdll, NtDeleteFile),
+	HOOK(ntdll, NtDeviceIoControlFile),
+	HOOK(ntdll, NtQueryDirectoryFile),
+	HOOK(ntdll, NtQueryInformationFile),
+	HOOK(ntdll, NtSetInformationFile),
+	HOOK(ntdll, NtOpenDirectoryObject),
+	HOOK(ntdll, NtCreateDirectoryObject),
+	HOOK(ntdll, NtQueryDirectoryObject),
+
+	// Native Registry Hooks
+	HOOK(ntdll, NtCreateKey),
+	HOOK(ntdll, NtOpenKey),
+	HOOK(ntdll, NtOpenKeyEx),
+	HOOK(ntdll, NtRenameKey),
+	HOOK(ntdll, NtReplaceKey),
+	HOOK(ntdll, NtEnumerateKey),
+	HOOK(ntdll, NtEnumerateValueKey),
+	HOOK(ntdll, NtSetValueKey),
+	HOOK(ntdll, NtQueryValueKey),
+	HOOK(ntdll, NtQueryMultipleValueKey),
+	HOOK(ntdll, NtDeleteKey),
+	HOOK(ntdll, NtDeleteValueKey),
+	HOOK(ntdll, NtLoadKey),
+	HOOK(ntdll, NtLoadKey2),
+	HOOK(ntdll, NtLoadKeyEx),
+	HOOK(ntdll, NtQueryKey),
+	HOOK(ntdll, NtSaveKey),
+	HOOK(ntdll, NtSaveKeyEx),
+
+	// Sync Hooks
+	HOOK(ntdll, NtCreateMutant),
+	HOOK(ntdll, NtOpenMutant),
+	HOOK(ntdll, NtReleaseMutant),
+	HOOK(ntdll, NtCreateEvent),
+	HOOK(ntdll, NtOpenEvent),
+	HOOK(ntdll, NtCreateNamedPipeFile),
+	HOOK(ntdll, NtAddAtom),
+	HOOK(ntdll, NtAddAtomEx),
+	HOOK(ntdll, NtFindAtom),
+	HOOK(ntdll, NtDeleteAtom),
+	HOOK(ntdll, NtQueryInformationAtom),
+
+	// Process Hooks
+	HOOK(ntdll, NtAllocateVirtualMemory),
+	HOOK(ntdll, NtAllocateVirtualMemoryEx),
+	HOOK(ntdll, NtReadVirtualMemory),
+	HOOK(ntdll, NtWriteVirtualMemory),
+	HOOK(ntdll, NtWow64WriteVirtualMemory64),
+	HOOK(ntdll, NtWow64ReadVirtualMemory64),
+	HOOK(ntdll, NtProtectVirtualMemory),
+	HOOK(ntdll, NtFreeVirtualMemory),
+	HOOK(ntdll, NtCreateProcess),
+	HOOK(ntdll, NtCreateProcessEx),
+	HOOK(ntdll, RtlCreateUserProcess),
+	HOOK(ntdll, NtOpenProcess),
+	HOOK(ntdll, NtTerminateProcess),
+	HOOK(ntdll, RtlReportSilentProcessExit),
+	HOOK(ntdll, NtResumeProcess),
+	HOOK(ntdll, NtCreateSection),
+	HOOK(ntdll, NtDuplicateObject),
+	HOOK(ntdll, NtMakeTemporaryObject),
+	HOOK(ntdll, NtMakePermanentObject),
+	HOOK(ntdll, NtOpenSection),
+	HOOK(ntdll, NtMapViewOfSection),
+	HOOK(ntdll, NtMapViewOfSectionEx),
+	HOOK(ntdll, NtUnmapViewOfSection),
+	HOOK(ntdll, NtUnmapViewOfSectionEx),
+	HOOK(ntdll, NtOpenProcessToken),
+	HOOK(ntdll, NtQueryInformationToken),
+	HOOK(ntdll, DbgUiWaitStateChange),
+
+	// Thread Hooks
+	HOOK(ntdll, NtCreateThread),
+	HOOK(ntdll, NtCreateThreadEx),
+	HOOK(ntdll, NtTerminateThread),
+	HOOK(ntdll, NtQueueApcThread),
+	HOOK(ntdll, NtQueueApcThreadEx),
+	HOOK(ntdll, NtOpenThread),
+	HOOK(ntdll, NtGetContextThread),
+#ifdef _WIN64
+	HOOK(ntdll, RtlWow64GetThreadContext),
+	HOOK(ntdll, RtlWow64SetThreadContext),
+#endif
+	HOOK(ntdll, NtSetContextThread),
+	HOOK(ntdll, NtSuspendThread),
+	HOOK(ntdll, NtResumeThread),
+	HOOK(ntdll, RtlCreateUserThread),
+	HOOK(ntdll, NtSetInformationThread),
+	HOOK(ntdll, NtQueryInformationThread),
+	HOOK(ntdll, NtYieldExecution),
+	HOOK(ntdll, NtContinue),
+
+	// Misc Hooks
+	//HOOK(ntdll, RtlMoveMemory),
+	HOOK(ntdll, RtlAddVectoredExceptionHandler),
+	HOOK(ntdll, LdrGetDllHandle),
+	HOOK(ntdll, LdrGetProcedureAddress),
+	HOOK(ntdll, LdrGetProcedureAddressForCaller),
+	HOOK_NOTAIL(ntdll, NtShutdownSystem, 1),
+	HOOK_NOTAIL(ntdll, NtSetSystemPowerState, 3),
+	HOOK_NOTAIL(ntdll, NtRaiseHardError, 6),
+	HOOK(ntdll, NtClose),
+	HOOK(ntdll, NtLoadDriver),
+	HOOK(ntdll, NtSetInformationProcess),
+	//HOOK(ntdll, NtQueryInformationProcess),
+	HOOK(ntdll, RtlDecompressBuffer),
+	HOOK(ntdll, RtlCompressBuffer),
+	HOOK(ntdll, NtQuerySystemInformation),
+#ifndef _WIN64
+	HOOK(ntdll, RtlDosPathNameToNtPathName_U),
+	HOOK(ntdll, NtQueryLicenseValue),
+#endif
+
+	// transaction functions (for process doppelganging)
+	HOOK(ntdll, NtCreateTransaction),
+	HOOK(ntdll, NtOpenTransaction),
+	HOOK(ntdll, NtRollbackTransaction),
+	HOOK(ntdll, NtCommitTransaction),
+	HOOK(ntdll, RtlSetCurrentTransaction),
+
+	// Sleep Hooks
+	HOOK(ntdll, NtQueryPerformanceCounter),
+	HOOK(ntdll, NtDelayExecution),
+	HOOK(ntdll, NtWaitForSingleObject),
+	HOOK(ntdll, NtWaitForMultipleObjects),
+	HOOK_SPECIAL(ntdll, NtQuerySystemTime),
+	HOOK(ntdll, NtSetTimer),
+	HOOK(ntdll, NtSetTimerEx),
+};
+
 // This hook set is intended to include only hooks which are necessary
 // to follow the execution chain with base functionality
 
 hook_t min_hooks[] = {
+	HOOK_NOTAIL_ALT(ntdll, RtlDispatchException, 2),
+	HOOK_NOTAIL(ntdll, NtRaiseException, 3),
+
 	HOOK_NOTAIL_ALT(ntdll, LdrLoadDll, 4),
 	HOOK_NOTAIL(ntdll, LdrUnloadDll, 1),
 	HOOK_SPECIAL(ntdll, NtCreateUserProcess),
 	HOOK_SPECIAL(kernel32, CreateProcessInternalW),
-
-	HOOK_SPECIAL(clrjit, compileMethod),
-	HOOK_SPECIAL(ole32, CoCreateInstance),
-	HOOK_SPECIAL(ole32, CoCreateInstanceEx),
-	HOOK_SPECIAL(ole32, CoGetClassObject),
-	HOOK_SPECIAL(ole32, CoGetObject),
-	HOOK_SPECIAL(combase, CoCreateInstance),
-	HOOK_SPECIAL(combase, CoCreateInstanceEx),
-	HOOK_SPECIAL(combase, CoGetClassObject),
-	HOOK_SPECIAL(combase, CoGetObject),
-
-	HOOK_NOTAIL_ALT(ntdll, RtlDispatchException, 2),
-	HOOK_NOTAIL(ntdll, NtRaiseException, 3),
 
 	HOOK(ntdll, NtCreateProcess),
 	HOOK(ntdll, NtCreateProcessEx),
@@ -790,13 +1077,23 @@ hook_t min_hooks[] = {
 	HOOK(ntdll, RtlCreateUserThread),
 	HOOK(kernel32, CreateRemoteThread),
 	HOOK(kernel32, CreateRemoteThreadEx),
+
+	HOOK_SPECIAL(clrjit, compileMethod),
+	HOOK_SPECIAL(ole32, CoCreateInstance),
+	HOOK_SPECIAL(ole32, CoCreateInstanceEx),
+	HOOK_SPECIAL(ole32, CoGetClassObject),
+	HOOK_SPECIAL(ole32, CoGetObject),
+	HOOK_SPECIAL(combase, CoCreateInstance),
+	HOOK_SPECIAL(combase, CoCreateInstanceEx),
+	HOOK_SPECIAL(combase, CoGetClassObject),
+	HOOK_SPECIAL(combase, CoGetObject),
+
 	HOOK(user32, SendNotifyMessageA),
 	HOOK(user32, SendNotifyMessageW),
 	HOOK(user32, SetWindowLongA),
 	HOOK(user32, SetWindowLongW),
 	HOOK(user32, SetWindowLongPtrA),
 	HOOK(user32, SetWindowLongPtrW),
-
 	HOOK(user32, SetWindowsHookExA),
 	HOOK(user32, SetWindowsHookExW),
 
@@ -848,6 +1145,8 @@ hook_t tls_hooks[] = {
 	HOOK(ncrypt, SslImportMasterKey),
 	HOOK(ncrypt, SslGenerateSessionKeys),
 	HOOK(ncrypt, SslHashHandshake),
+	HOOK(ncrypt, SslExpandTrafficKeys),
+	HOOK(ncrypt, SslExpandExporterMasterKey),
 };
 
 hook_t office_hooks[] = {
@@ -1097,10 +1396,6 @@ hook_t office_hooks[] = {
 	HOOK(kernel32, SwitchToThread),
 
 	// Misc Hooks
-#ifndef _WIN64
-	//HOOK(ntdll, memcpy),
-#endif
-	//HOOK(msvcrt, memcpy),
 	//HOOK(ntdll, RtlMoveMemory),
 	HOOK(kernel32, OutputDebugStringA),
 	HOOK(kernel32, OutputDebugStringW),
@@ -1117,6 +1412,8 @@ hook_t office_hooks[] = {
 	HOOK(ntdll, LdrGetProcedureAddress),
 	HOOK(ntdll, LdrGetProcedureAddressForCaller),
 	HOOK(kernel32, DeviceIoControl),
+	HOOK(kernel32, GetSystemFirmwareTable),
+	HOOK(kernel32, EnumSystemFirmwareTables),
 	HOOK_NOTAIL(ntdll, NtShutdownSystem, 1),
 	HOOK_NOTAIL(ntdll, NtSetSystemPowerState, 3),
 	HOOK_NOTAIL(user32, ExitWindowsEx, 2),
@@ -1172,6 +1469,7 @@ hook_t office_hooks[] = {
 	HOOK(oleaut32, VarBstrCat),
 	HOOK_NOTAIL(usp10, ScriptIsComplex, 3),
 	HOOK_NOTAIL(inseng,DownloadFile,3),
+	HOOK(imagehlp, MapFileAndCheckSumA),
 #ifndef _WIN64
 	HOOK(ntdll, RtlDosPathNameToNtPathName_U),
 	HOOK(ntdll, NtQueryLicenseValue),
@@ -1180,6 +1478,9 @@ hook_t office_hooks[] = {
 	HOOK(shlwapi, UrlCanonicalizeW),
 	HOOK_NOTAIL(vbe7, rtcCreateObject2, 3),
 #endif
+	HOOK(User32, GetClipboardData),
+	HOOK(User32, OpenClipboard),
+	HOOK(User32, SetClipboardData),
 
 	// PE resource related functions
 	HOOK(kernel32, FindResourceExA),
@@ -1260,6 +1561,8 @@ hook_t office_hooks[] = {
 	HOOK(ncrypt, SslDecryptPacket),
 	HOOK(iphlpapi, GetAdaptersAddresses),
 	HOOK(iphlpapi, GetAdaptersInfo),
+	HOOK(iphlpapi, IcmpSendEcho),
+	HOOK(iphlpapi, IcmpSendEcho2),
 	HOOK(urlmon, CoInternetSetFeatureEnabled),
 
 	// Service Hooks
@@ -1278,6 +1581,7 @@ hook_t office_hooks[] = {
 	HOOK(ntdll, NtQueryPerformanceCounter),
 	HOOK(ntdll, NtDelayExecution),
 	HOOK(ntdll, NtWaitForSingleObject),
+	HOOK(ntdll, NtWaitForMultipleObjects),
 	HOOK_SPECIAL(kernel32, GetLocalTime),
 	HOOK_SPECIAL(kernel32, GetSystemTime),
 	HOOK_SPECIAL(kernel32, GetSystemTimeAsFileTime),
@@ -1459,6 +1763,10 @@ hook_t test_hooks[] = {
 	HOOK_SPECIAL(ntdll, NtContinue),
 };
 
+hook_t exe_hooks[] = {
+	HOOK_EXE(FindFixAndRun),
+};
+
 BOOL inside_hook(LPVOID Address)
 {
 	for (unsigned int i = 0; i < hooks_arraysize; i++) {
@@ -1477,7 +1785,67 @@ BOOL set_hooks_dll(const wchar_t *library)
 			ret = TRUE;
 			if (hook_api(hooks+i, g_config.hook_type) < 0)
 				DebugOutput("set_hooks_dll: Unable to hook %s", (hooks+i)->funcname);
+			else if (g_config.hook_range)
+				DebugOutput("set_hooks_dll: Hooked %s", (hooks+i)->funcname);
 		}
+	}
+	return ret;
+}
+
+void set_hooks_exe(void)
+{
+    LDR_MODULE* mod;
+    PEB* peb = (PEB*)get_peb();
+    mod = (LDR_MODULE*)peb->LoaderData->InLoadOrderModuleList.Flink;
+    HMODULE ullExeBase = (HMODULE)(mod->BaseAddress);
+
+    int hook_count = sizeof(exe_hooks) / sizeof(exe_hooks[0]);
+    char* func_names[sizeof(exe_hooks) / sizeof(exe_hooks[0])];
+
+    for (int i = 0; i < hook_count; i++)
+        func_names[i] = (char*)exe_hooks[i].funcname;
+
+    SIZE_T found_count = 0;
+    NameByAddress* results = GetAddressesByYara(ullExeBase, func_names, hook_count, &found_count);
+
+    if (!results || found_count == 0) {
+        if (results) free(results);
+        return;
+    }
+
+    for (int i = 0; i < hook_count; i++) {
+		if (exe_hooks[i].timestamp && exe_hooks[i].rva) {
+			hook_t* hook = &exe_hooks[i];
+			if (hook_api(hook, g_config.hook_type) < 0)
+				DebugOutput("set_hooks_exe: Failed to hook %s at RVA 0x%x", hook->funcname, hook->rva);
+			else
+				DebugOutput("set_hooks_exe: Hooked %s at RVA 0x%x", hook->funcname, hook->rva);
+		}
+        else for (SIZE_T j = 0; j < found_count; j++) {
+            if (results[j].FunctionName && results[j].Address && !strcmp(results[j].FunctionName, exe_hooks[i].funcname)) {
+                hook_t* hook = &exe_hooks[i];
+                hook->addr = results[j].Address;
+
+                if (hook_api(hook, g_config.hook_type) < 0)
+                    DebugOutput("set_hooks_exe: Failed to hook %s at 0x%p", hook->funcname, hook->addr);
+                else
+                    DebugOutput("set_hooks_exe: Hooked %s at 0x%p", hook->funcname, hook->addr);
+            }
+        }
+    }
+
+    free(results);
+
+}
+
+BOOL dll_is_hooked(const wchar_t *library)
+{
+	if (!library)
+		return FALSE;
+	BOOL ret = FALSE;
+	for (unsigned int i = 0; i < hooks_arraysize; i++) {
+		if (!wcsicmp((hooks+i)->library, library))
+			ret = TRUE;
 	}
 	return ret;
 }
@@ -1507,7 +1875,6 @@ void set_hooks_by_export_directory(const wchar_t *exportdirectory, const wchar_t
 			}
 		}
 	}
-	DebugOutput("set_hooks_by_export_directory: Hooked %d out of %d functions\n", Hooked, hooks_arraysize);
 }
 
 extern void invalidate_regions_for_hook(const hook_t *hook);
@@ -1520,6 +1887,114 @@ void revalidate_all_hooks(void)
 			(hooks+i)->hook_addr = NULL;
 			invalidate_regions_for_hook(hooks+i);
 		}
+	}
+}
+
+static com_hook_t* com_hooks = NULL;
+static int num_com_hooks = 0;
+static int num_com_hooks_installed = 0;
+static int* com_hook_state = NULL;
+int com_hooks_initialized = 0;
+
+void init_com_hooks(void) {
+	com_hooks = g_com_hooks;
+	num_com_hooks = ARRAYSIZE(g_com_hooks);
+	com_hook_state = calloc(sizeof(*com_hook_state), num_com_hooks);
+}
+
+int set_WbemLocator_hooks(PVOID pComObject, hook_t* hook) {
+	IWbemLocator* pIWebmLocator = (IWbemLocator*)pComObject;
+	DWORD old_protect;
+	VirtualProtect(hook, sizeof(*hook), PAGE_EXECUTE_READWRITE, &old_protect);
+	if (!strncmp(hook->funcname, "WbemLocator_ConnectServer", 25))
+		hook->addr = pIWebmLocator->lpVtbl->ConnectServer;
+	if (hook->addr) {
+		return hook_api(hook, g_config.hook_type);
+	}
+
+	return -1;
+}
+
+int set_IWbemServices_hooks(PVOID pComObject, hook_t* hook) {
+	IWbemServices* pIWbemServices = (IWbemServices*)pComObject;
+	DWORD old_protect;
+	VirtualProtect(hook, sizeof(*hook), PAGE_EXECUTE_READWRITE, &old_protect);
+	if (!strcmp(hook->funcname, "IWbemServices_ExecQuery")) {
+		hook->addr = pIWbemServices->lpVtbl->ExecQuery;
+	}
+	else if (!strncmp(hook->funcname, "IWbemServices_ExecQueryAsync", 28)) {
+		hook->addr = pIWbemServices->lpVtbl->ExecQueryAsync;
+	}
+	else if (!strncmp(hook->funcname, "IWbemServices_GetObjectW", 24)) {
+		hook->addr = pIWbemServices->lpVtbl->GetObject;
+	}
+	else if (!strncmp(hook->funcname, "IWbemServices_GetObjectAsync", 28)) {
+		hook->addr = pIWbemServices->lpVtbl->GetObjectAsync;
+	}
+	else if (!strcmp(hook->funcname, "IWbemServices_ExecMethod")) {
+		hook->addr = pIWbemServices->lpVtbl->ExecMethod;
+	}
+	else if (!strncmp(hook->funcname, "IWbemServices_ExecMethodAsync", 29)) {
+		hook->addr = pIWbemServices->lpVtbl->ExecMethodAsync;
+	}
+	else if (!strcmp(hook->funcname, "IWbemServices_CreateInstanceEnum")) {
+		hook->addr = pIWbemServices->lpVtbl->CreateInstanceEnum;
+	}
+	else if (!strncmp(hook->funcname, "IWbemServices_CreateInstanceEnumAsync", 37)) {
+		hook->addr = pIWbemServices->lpVtbl->CreateInstanceEnumAsync;
+	}
+	if (hook->addr) {
+		return hook_api(hook, g_config.hook_type);
+	}
+	return -1;
+}
+
+extern __declspec(thread) BOOL bHookViaWbemLocator;
+void set_com_hooks(REFCLSID	rclsid, REFIID riid, PVOID pComObject) {
+	if (!com_hooks_initialized) {
+		init_com_hooks();
+		com_hooks_initialized = 1;
+	}
+	if (num_com_hooks_installed < num_com_hooks) {
+		lasterror_t lasterrors;
+		get_lasterrors(&lasterrors);
+		__try {
+			for (int hook_idx = 0; hook_idx < num_com_hooks; hook_idx++) {
+				if (!com_hook_state[hook_idx]) {
+					int ret = 1;
+					com_hook_t* com_hook = &com_hooks[hook_idx];
+					hook_t* hook = &(com_hook->hook);
+					if (
+						(rclsid && com_hook->rclsid && IsEqualCLSID(rclsid, com_hook->rclsid)) || // Matches a CLSID we want to hook
+						(com_hook->riid && riid && IsEqualIID(riid, com_hook->riid)) || // Matches an IID we want to hook
+						(!rclsid && !riid) // Hook COM objects identified by funcname
+					) {
+						if (rclsid && riid) {
+							if (IsEqualCLSID(rclsid, &CLSID_WbemLocator) && IsEqualIID(riid, &IID_IWbemLocator)) {
+								ret = set_WbemLocator_hooks(pComObject, hook);
+							}
+						}
+						else if (!rclsid && !riid && !com_hook->rclsid && !com_hook->riid) {
+							if (bHookViaWbemLocator && !strncmp(hook->funcname, "IWbemServices_", 14)) {
+								ret = set_IWbemServices_hooks(pComObject, hook);
+							}
+						}
+					}
+					if (ret == 0) {
+						DebugOutput("Successfully installed hook on COM Object function %s", hook->funcname);
+						num_com_hooks_installed++;
+						com_hook_state[hook_idx] = 1;
+					}
+					else if (ret < 0) {
+						DebugOutput("WARNING: Unable to hook COM Object function %s", hook->funcname);
+					}
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			;
+		}
+		set_lasterrors(&lasterrors);
 	}
 }
 
@@ -1590,6 +2065,11 @@ void set_hooks()
 		hooks_size = sizeof(browser_hooks);
 		hooks_arraysize = ARRAYSIZE(browser_hooks);
 	}
+	else if (g_config.native) {
+		hooks = native_hooks;
+		hooks_size = sizeof(native_hooks);
+		hooks_arraysize = ARRAYSIZE(native_hooks);
+	}
 	else {
 		hooks = full_hooks;
 		hooks_size = sizeof(full_hooks);
@@ -1629,9 +2109,9 @@ void set_hooks()
 			break;
 
 		if (g_config.hook_range)
-			DebugOutput("set_hooks: Hooking %s", (hooks+i)->funcname);
+			DebugOutput("set_hooks: Hooking %ws::%s", (hooks+i)->library, (hooks+i)->funcname);
 		if (hook_api(hooks+i, g_config.hook_type) < 0)
-			DebugOutput("set_hooks: Unable to hook %s", (hooks+i)->funcname);
+			DebugOutput("set_hooks: Unable to hook %ws::%s", (hooks+i)->library, (hooks+i)->funcname);
 		else
 			Hooked++;
 	}
@@ -1649,6 +2129,8 @@ void set_hooks()
 		register_dll_notification_manually(&New_DllLoadNotification);
 
 	DebugOutput("Hooked %d out of %d functions\n", Hooked, hooks_arraysize);
+
+	set_hooks_exe();
 
 	hook_enable();
 }

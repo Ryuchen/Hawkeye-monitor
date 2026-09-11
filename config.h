@@ -23,6 +23,27 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define BREAKPOINT_MAX	0x100
 #define SYSBP_MAX		0x400
 
+// Anti-analysis related items so we can be consistent across various APIs
+#define SPOOFED_DISK_SIZE	0x10000000000ull // 1TB
+#define RECOVERY_PARTITION_SIZE	0x1f2af000  // Taken from random Win10 install
+
+#define SPOOFED_GPU_RAM_WMI 0xfff00000L // 4293918720; WMI uses lVal (long) so we have an "overflowed" value, 
+#define SPOOFED_GPU_RAM 0x100000000l  // 4GB
+#define SPOOFED_GPU_NAME L"NVIDIA GTX 1650"
+
+#define SPOOFED_RAM 0x100000000l  // 4GB
+#define SPOOFED_RAM_RESERVED 0x410000
+
+#define SPOOFED_CPU_CORE_NUM 4
+
+// Defines to string representation of above vars so we don't need to do useless converts
+#define WIDE_SPOOFED_RAM L"4294967296"
+#define WIDE_SPOOFED_RAM_IN_KB L"4194304"
+#define WIDE_DISK_LOGICAL_SIZE L"1098988720128" // SPOOFED_DISK_SIZE - RECOVERY_PARTITION_SIZE
+
+#define SPOOFED_REFRESH_RATE 60
+
+
 struct _g_config {
 	// name of the pipe to communicate with cuckoo
 	wchar_t pipe_name[MAX_PATH];
@@ -104,6 +125,12 @@ struct _g_config {
 	// Default hook type (may be overridden for specific functions)
 	int hook_type;
 
+	// Hook trampoline allocated in low (<2GB) memory (64-bit)
+	int hook_low;
+
+	// Attempt to restore modified hooks detected by unhook thread
+	int hook_restore;
+
 	// Disable hook content
 	int disable_hook_content;
 
@@ -119,8 +146,20 @@ struct _g_config {
 	// Language override
 	int lang;
 
+	// Spoofed CPU core count
+	unsigned int spoofed_cpu_count;
+
+	// protected processes
+	unsigned int protected_pids;
+
 	// ntdll write protection
 	unsigned int ntdll_protect;
+
+	// ntdll unhook protection (NtReadFile-based)
+	unsigned int ntdll_unhook;
+
+	// hook write protection
+	unsigned int hook_protect;
 
 	// ntdll remap protection
 	unsigned int ntdll_remap;
@@ -134,6 +173,7 @@ struct _g_config {
 	BOOLEAN suspend_logging;
 
 	char *excluded_apinames[EXCLUSION_MAX];
+	char *included_apinames[EXCLUSION_MAX];
 	wchar_t *excluded_dllnames[EXCLUSION_MAX];
 	char *base_on_apiname[EXCLUSION_MAX];
  	char *dump_on_apinames[EXCLUSION_MAX];
@@ -159,6 +199,9 @@ struct _g_config {
 	// should we terminate processes after dumping on terminate_event?
 	int terminate_processes;
 
+	// should we unhook (restore hooks) instead of leaving them installed on terminate_event?
+	int unhook_on_terminate;
+
 	// dump regions containing c2
 	int dump_config_region;
 
@@ -183,14 +226,14 @@ struct _g_config {
 	// for dumping of crypto API ImportKey buffers
 	int dump_keys;
 
-	// for PlugX config & payload extraction
-	int plugx;
-
 	// syscall hooks
 	int syscall;
 
 	// Enable debugger
 	int debugger;
+
+	// Enable interactive debugger (CAPEsolo)
+	int idbg;
 
 	// Fake RDTSC
 	int fake_rdtsc;
@@ -209,15 +252,22 @@ struct _g_config {
 
 	// YARA scans
 	int yarascan;
+	int yara_timeout;
 
 	// AMSI dumps (Win10+)
 	int amsidump;
+
+	// .NET JIT cache dumps
+	unsigned int jit_dumps;
 
 	// Minimal hook set
 	int minhook;
 
 	// Zero hook set
 	int zerohook;
+
+	// Native hook set
+	int native;
 
 	// Microsoft Office hook set
 	int office;
@@ -239,6 +289,12 @@ struct _g_config {
 
 	// Allow scans/dumps with loader lock held
 	int loaderlock_scans;
+
+	// Specify custom trace stepping behavior
+	int stepmode;
+
+	// Enable Windows Loader snaps output
+	int snaps;
 
 	char *break_on_apiname;
 	char *break_on_modname;
@@ -263,7 +319,9 @@ struct _g_config {
 	char typestring[MAX_PATH], typestring0[MAX_PATH], typestring1[MAX_PATH], typestring2[MAX_PATH], typestring3[MAX_PATH];
 	PVOID bp[BREAKPOINT_MAX], sysbp[SYSBP_MAX];
 	char *action[BREAKPOINT_MAX];
+	BOOLEAN modulenames;
 	BOOLEAN loopskip;
+	int softbpmode;
 	int sysbpmode;
 	// search string
 	char *str[MAX_PATH];
@@ -277,10 +335,12 @@ struct _g_config {
 	int base_on_caller;
 	int trace_times;
 	char *trace_into_api[EXCLUSION_MAX];
+	int hook_watch;
+	int sleep_skip_seconds;
 };
 
 extern struct _g_config g_config;
 
-int read_config(void);
+void read_config(void);
 
 #endif

@@ -32,11 +32,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "CAPE\CAPE.h"
 
 extern char *our_process_name;
-extern int path_is_system(const wchar_t *path_w);
-extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 
 static _NtQueryInformationProcess pNtQueryInformationProcess;
-static _NtQueryInformationThread pNtQueryInformationThread;
 static _RtlGenRandom pRtlGenRandom;
 static _NtQueryAttributesFile pNtQueryAttributesFile;
 static _NtQueryObject pNtQueryObject;
@@ -45,6 +42,7 @@ static _NtDelayExecution pNtDelayExecution;
 static _NtQuerySystemInformation pNtQuerySystemInformation;
 static _RtlEqualUnicodeString pRtlEqualUnicodeString;
 static _RtlInitUnicodeString pRtlInitUnicodeString;
+_NtQueryInformationThread pNtQueryInformationThread;
 _NtMapViewOfSection pNtMapViewOfSection;
 _NtUnmapViewOfSection pNtUnmapViewOfSection;
 _NtAllocateVirtualMemory pNtAllocateVirtualMemory;
@@ -53,6 +51,8 @@ _NtFreeVirtualMemory pNtFreeVirtualMemory;
 _LdrRegisterDllNotification pLdrRegisterDllNotification;
 _RtlNtStatusToDosError pRtlNtStatusToDosError;
 _RtlCompareMemory pRtlCompareMemory;
+_NtQueryEvent pNtQueryEvent;
+_NtQueryVirtualMemory pNtQueryVirtualMemory;
 
 void resolve_runtime_apis(void)
 {
@@ -81,6 +81,7 @@ void resolve_runtime_apis(void)
 	*(FARPROC *)&pRtlAdjustPrivilege = GetProcAddress(ntdllbase, "RtlAdjustPrivilege");
 	*(FARPROC *)&pRtlNtStatusToDosError = GetProcAddress(ntdllbase, "RtlNtStatusToDosError");
 	*(FARPROC *)&pRtlCompareMemory = GetProcAddress(ntdllbase, "RtlCompareMemory");
+	*(FARPROC*)&pNtQueryVirtualMemory = GetProcAddress(ntdllbase, "NtQueryVirtualMemory");
 }
 
 ULONG_PTR g_our_dll_base;
@@ -99,6 +100,7 @@ BOOLEAN is_address_in_monitor(ULONG_PTR address)
 
 	return FALSE;
 }
+
 void raw_sleep(int msecs)
 {
 	LARGE_INTEGER interval;
@@ -128,6 +130,41 @@ void num_to_string(char *buf, unsigned int buflen, unsigned int num)
 		dec /= 10;
 	}
 	buf[i] = '\0';
+}
+
+static const char hexchars[] = "0123456789ABCDEF";
+
+char *num_to_hex(char *buf, unsigned int width, ULONG_PTR num)
+{
+    buf[width] = '\0';
+    unsigned int count = width;
+
+	while (count--) {
+        buf[count] = hexchars[num & 0xF];
+        num >>= 4;
+    }
+
+    return buf + width;
+}
+
+void uuid_to_string(IID id, char *idbuf)
+{
+    idbuf = num_to_hex(idbuf, 8, id.Data1);
+    *idbuf++ = '-';
+
+    idbuf = num_to_hex(idbuf, 4, id.Data2);
+    *idbuf++ = '-';
+
+    idbuf = num_to_hex(idbuf, 4, id.Data3);
+    *idbuf++ = '-';
+
+    for (int i = 0; i < 2; i++)
+        idbuf = num_to_hex(idbuf, 2, id.Data4[i]);
+
+    *idbuf++ = '-';
+
+    for (int i = 2; i < 8; i++)
+        idbuf = num_to_hex(idbuf, 2, id.Data4[i]);
 }
 
 unsigned short our_htons(unsigned short num)
@@ -598,6 +635,41 @@ BOOLEAN is_valid_address_range(ULONG_PTR start, DWORD len)
 	return TRUE;
 }
 
+BOOLEAN our_isbadreadptr(const void* addr, ULONG len)
+{
+	SIZE_T reslen;
+	PUCHAR startaddr = (PUCHAR)addr;
+	PUCHAR endaddr = startaddr + len;
+	PUCHAR p;
+	MEMORY_BASIC_INFORMATION meminfo;
+	lasterror_t lasterror;
+	BOOLEAN ret = FALSE;
+
+	/* check for overflow */
+	if ((ULONG_PTR)endaddr < (ULONG_PTR)startaddr)
+		return TRUE;
+
+	get_lasterrors(&lasterror);
+	for (p = startaddr; p < endaddr; p = (PUCHAR)meminfo.BaseAddress + meminfo.RegionSize) {
+		memset(&meminfo, 0, sizeof(meminfo));
+		if (pNtQueryVirtualMemory(NtCurrentProcess(), p, MemoryBasicInformation, &meminfo, sizeof(meminfo), &reslen)) {
+			ret = TRUE;
+			break;
+		}
+		if (!(meminfo.State & MEM_COMMIT) || !(meminfo.Type & (MEM_IMAGE | MEM_MAPPED | MEM_PRIVATE))) {
+			ret = TRUE;
+			break;
+		}
+		if ((meminfo.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (meminfo.Type != MEM_IMAGE || meminfo.Protect != PAGE_NOACCESS)) {
+			ret = TRUE;
+			break;
+		}
+	}
+
+	set_lasterrors(&lasterror);
+	return ret;
+}
+
 DWORD parent_process_id() // By Napalm @ NetCore2K (rohitab.com)
 {
 	PROCESS_BASIC_INFORMATION pbi;
@@ -605,6 +677,36 @@ DWORD parent_process_id() // By Napalm @ NetCore2K (rohitab.com)
 
 	if (pNtQueryInformationProcess(GetCurrentProcess(), ProcessBasicInformation, &pbi, sizeof(pbi), &ulSize) >= 0 && ulSize == sizeof(pbi))
 		return (DWORD)pbi.ParentProcessId;
+
+	return 0;
+}
+
+int path_is_system(const wchar_t *path_w)
+{
+	if (!path_w)
+		return 0;
+
+	if (!wcsnicmp(path_w, L"\\Device\\HarddiskVolume", 22))
+		path_w += 24;
+	else if (!wcsnicmp(path_w + 1, L":\\", 2))
+		path_w += 3;
+
+	if (((!wcsnicmp(path_w, L"windows\\system32\\", 17) ||
+		!wcsnicmp(path_w, L"windows\\syswow64\\", 17) ||
+		!wcsnicmp(path_w, L"windows\\sysnative\\", 18))))
+		return 1;
+
+	return 0;
+}
+
+int path_is_program_files(const wchar_t *path_w)
+{
+	if (!path_w)
+		return 0;
+
+	if (((!wcsnicmp(path_w + 1, L":\\program files\\", 16) ||
+		!wcsnicmp(path_w + 1, L":\\program files (x86)\\", 22))))
+		return 1;
 
 	return 0;
 }
@@ -782,11 +884,22 @@ BOOL file_exists(const OBJECT_ATTRIBUTES *obj)
 {
 	FILE_BASIC_INFORMATION basic_information;
 	wchar_t pipe_base_name[] = L"\\??\\pipe\\";
-	if (!wcsnicmp(obj->ObjectName->Buffer, pipe_base_name, wcslen(pipe_base_name)))
-		return FALSE;
-	NTSTATUS ret = pNtQueryAttributesFile(obj, &basic_information);
-	if (NT_SUCCESS(ret) || ret == STATUS_INVALID_DEVICE_REQUEST)
-		return TRUE;
+	NTSTATUS ret;
+
+	__try {
+		if (obj == NULL || obj->ObjectName == NULL || obj->ObjectName->Buffer == NULL)
+			return FALSE;
+
+		if (!wcsnicmp(obj->ObjectName->Buffer, pipe_base_name, wcslen(pipe_base_name)))
+			return FALSE;
+
+		ret = pNtQueryAttributesFile(obj, &basic_information);
+		if (NT_SUCCESS(ret) || ret == STATUS_INVALID_DEVICE_REQUEST)
+			return TRUE;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		;
+	}
 	return FALSE;
 }
 
@@ -813,6 +926,21 @@ BOOL is_in_dll_range(ULONG_PTR addr)
 		if (addr >= dll_ranges[i].start && addr < dll_ranges[i].end)
 			return TRUE;
 	}
+	return FALSE;
+}
+
+BOOL remove_dll_range(ULONG_PTR addr)
+{
+    DWORD i;
+    for (i = 0; i < loaded_dlls; i++) {
+        if (addr < dll_ranges[i].start || addr >= dll_ranges[i].end)
+            continue;
+		dll_ranges[i] = dll_ranges[loaded_dlls - 1];
+		dll_ranges[loaded_dlls - 1].start = 0;
+		dll_ranges[loaded_dlls - 1].end = 0;
+		loaded_dlls--;
+		return TRUE;
+    }
 	return FALSE;
 }
 
@@ -849,6 +977,7 @@ void add_all_dlls_to_dll_ranges(void)
 		memcpy(ModulePath.Buffer, mod->FullDllName.Buffer, ModulePath.Length * sizeof(WCHAR));
 		// skip dlls in same directory as exe
 		if (!path_is_system(ModulePath.Buffer) && pRtlEqualUnicodeString(&ProcessPath, &ModulePath, FALSE) || (ULONG_PTR)mod->BaseAddress == base_of_dll_of_interest) {
+			DebugOutput("add_all_dlls_to_dll_ranges: skipping %ws", ModulePath.Buffer);
 			free(ModulePath.Buffer);
 			continue;
 		}
@@ -909,6 +1038,26 @@ char *convert_address_to_dll_name_and_offset(ULONG_PTR addr, unsigned int *offse
 			buf[i] = (char)mod->BaseDllName.Buffer[i];
 		*offset = (unsigned int)(addr - (ULONG_PTR)mod->BaseAddress);
 		return buf;
+	}
+	return NULL;
+}
+
+UNICODE_STRING* get_module_name(ULONG_PTR addr)
+{
+	PLDR_DATA_TABLE_ENTRY mod;
+	PLIST_ENTRY pHeadEntry;
+	PLIST_ENTRY pListEntry;
+	PEB *peb = (PEB *)get_peb();
+
+	pHeadEntry = &peb->LoaderData->InLoadOrderModuleList;
+	for(pListEntry = pHeadEntry->Flink;
+		pListEntry != pHeadEntry;
+		pListEntry = pListEntry->Flink)
+	{
+		mod = CONTAINING_RECORD(pListEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderModuleList);
+		if (addr < (ULONG_PTR)mod->BaseAddress || addr >= ((ULONG_PTR)mod->BaseAddress + mod->SizeOfImage))
+			continue;
+		return &mod->BaseDllName;
 	}
 	return NULL;
 }
@@ -1007,19 +1156,23 @@ uint32_t path_from_handle(HANDLE handle,
 	return length;
 }
 
-uint32_t path_from_object_attributes(const OBJECT_ATTRIBUTES *obj,
-	wchar_t *path, uint32_t buffer_length)
+uint32_t path_from_object_attributes(const OBJECT_ATTRIBUTES *obj, wchar_t *path, uint32_t buffer_length)
 {
 	uint32_t copylen, obj_length, length;
 
-	if (obj->ObjectName == NULL || obj->ObjectName->Buffer == NULL) {
-		return path_from_handle(obj->RootDirectory, path, buffer_length);;
-	}
+	if (obj == NULL)
+		return 0;
+
+	if (obj->ObjectName == NULL || obj->ObjectName->Buffer == NULL)
+		return path_from_handle(obj->RootDirectory, path, buffer_length);
 
 	// ObjectName->Length is actually the size in bytes.
 	obj_length = obj->ObjectName->Length / sizeof(wchar_t);
 
 	copylen = min(obj_length, buffer_length - 1);
+
+	if (our_isbadreadptr(obj->ObjectName->Buffer, copylen * sizeof(wchar_t)))
+		return 0;
 
 	if (obj->RootDirectory == NULL) {
 		memcpy(path, obj->ObjectName->Buffer, copylen * sizeof(wchar_t));
@@ -1116,8 +1269,14 @@ out:
 
 wchar_t *ensure_absolute_unicode_path(wchar_t *out, const wchar_t *in)
 {
-	wchar_t *tmpout = NULL;
-	wchar_t *nonexistent = NULL;
+	unsigned int path_buf_size = 2048;
+	wchar_t stack_tmpout[2048];
+	wchar_t stack_nonexistent[2048];
+	wchar_t *tmpout = stack_tmpout;
+	wchar_t *nonexistent = stack_nonexistent;
+	BOOL allocated_tmpout = FALSE;
+	BOOL allocated_nonexistent = FALSE;
+
 	unsigned int lenchars;
 	unsigned int nonexistentidx;
 	wchar_t *pathcomponent = NULL;
@@ -1149,62 +1308,85 @@ wchar_t *ensure_absolute_unicode_path(wchar_t *out, const wchar_t *in)
 		goto out;
 	}
 
-	tmpout = malloc(32768 * sizeof(wchar_t));
-	nonexistent = malloc(32768 * sizeof(wchar_t));
-
-	if (tmpout == NULL || nonexistent == NULL)
-		goto normal_copy;
+	if (inlen >= 2000) {
+		path_buf_size = 32768;
+		tmpout = malloc(path_buf_size * sizeof(wchar_t));
+		nonexistent = malloc(path_buf_size * sizeof(wchar_t));
+		if (tmpout == NULL || nonexistent == NULL) {
+			if (tmpout) free(tmpout);
+			if (nonexistent) free(nonexistent);
+			tmpout = stack_tmpout;
+			nonexistent = stack_nonexistent;
+			path_buf_size = 2048;
+		} else {
+			allocated_tmpout = TRUE;
+			allocated_nonexistent = TRUE;
+		}
+	}
 
 	if (!wcsnicmp(inadj, L"\\device\\", 8) || !wcsnicmp(inadj, L"\\systemroot", 11)) {
 		// handle \\Device\\* and \\systemroot\\*
 		unsigned int matchlen;
-		wchar_t *tmpout2;
+		wchar_t stack_tmpout2[2048];
+		wchar_t *tmpout2 = stack_tmpout2;
+		BOOL allocated_tmpout2 = FALSE;
 		wchar_t *retstr = get_matching_unicode_specialname(inadj, &matchlen);
 		if (retstr == NULL)
 			goto normal_copy;
 		// rewrite \\Device\\HarddiskVolumeX etc to the appropriate drive letter
-		tmpout2 = malloc(32768 * sizeof(wchar_t));
-		if (tmpout2 == NULL)
-			goto normal_copy;
+		if (path_buf_size > 2048) {
+			tmpout2 = malloc(path_buf_size * sizeof(wchar_t));
+			if (tmpout2 == NULL) {
+				tmpout2 = stack_tmpout2;
+			} else {
+				allocated_tmpout2 = TRUE;
+			}
+		}
 
 		wcscpy(tmpout2, L"\\\\?\\");
 		wcscat(tmpout2, retstr);
-		wcsncat(tmpout2, inadj + matchlen, 32768 - 4 - 3);
-		if (!GetFullPathNameW(tmpout2, 32768, tmpout, NULL)) {
-			free(tmpout2);
+		wcsncat(tmpout2, inadj + matchlen, path_buf_size - 4 - 3);
+		if (!GetFullPathNameW(tmpout2, path_buf_size, tmpout, NULL)) {
+			if (allocated_tmpout2) free(tmpout2);
 			goto normal_copy;
 		}
-		free(tmpout2);
+		if (allocated_tmpout2) free(tmpout2);
 	}
 	else if (inlen > 1 && inadj[1] == L':') {
-		wchar_t *tmpout2;
-
-		tmpout2 = malloc(32768 * sizeof(wchar_t));
-		if (tmpout2 == NULL)
-			goto normal_copy;
+		wchar_t stack_tmpout2[2048];
+		wchar_t *tmpout2 = stack_tmpout2;
+		BOOL allocated_tmpout2 = FALSE;
+		if (path_buf_size > 2048) {
+			tmpout2 = malloc(path_buf_size * sizeof(wchar_t));
+			if (tmpout2 == NULL) {
+				tmpout2 = stack_tmpout2;
+			} else {
+				allocated_tmpout2 = TRUE;
+			}
+		}
 
 		wcscpy(tmpout2, L"\\\\?\\");
-		wcsncat(tmpout2, inadj, 32768 - 4);
-		if (!GetFullPathNameW(tmpout2, 32768, tmpout, NULL)) {
-			free(tmpout2);
+		wcsncat(tmpout2, inadj, path_buf_size - 4);
+		if (!GetFullPathNameW(tmpout2, path_buf_size, tmpout, NULL)) {
+			if (allocated_tmpout2) free(tmpout2);
 			goto normal_copy;
 		}
-		free(tmpout2);
+		if (allocated_tmpout2) free(tmpout2);
 	}
 	else if (is_globalroot) {
 		// handle \\??\\*\\*
 		goto globalroot_copy;
 	}
 	else {
-		if (!GetFullPathNameW(inadj, 32768, tmpout, NULL))
+		if (!GetFullPathNameW(inadj, path_buf_size, tmpout, NULL))
 			goto normal_copy;
 	}
 
 	lenchars = 0;
-	nonexistentidx = 32767;
+	nonexistentidx = path_buf_size - 1;
 	nonexistent[nonexistentidx] = L'\0';
 	while (lenchars == 0) {
-		lenchars = GetLongPathNameW(tmpout, out, 32768);
+		lenchars = GetLongPathNameW(tmpout, out, path_buf_size);
 		if (lenchars)
 			break;
 		if (GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND && GetLastError() != ERROR_INVALID_NAME)
@@ -1217,7 +1399,7 @@ wchar_t *ensure_absolute_unicode_path(wchar_t *out, const wchar_t *in)
 		memcpy(nonexistent + nonexistentidx, pathcomponent, pathcomponentlen * sizeof(wchar_t));
 		*pathcomponent = L'\0';
 	}
-	wcsncat(out, nonexistent + nonexistentidx, 32768 - lstrlenW(out));
+	wcsncat(out, nonexistent + nonexistentidx, path_buf_size - lstrlenW(out));
 
 	if (!wcsncmp(out, L"\\\\?\\", 4))
 		memmove(out, out + 4, (lstrlenW(out) + 1 - 4) * sizeof(wchar_t));
@@ -1231,18 +1413,18 @@ wchar_t *ensure_absolute_unicode_path(wchar_t *out, const wchar_t *in)
 
 globalroot_copy:
 	wcscpy(out, L"\\??\\");
-	wcsncat(out, inadj, 32768 - 4);
+	wcsncat(out, inadj, path_buf_size - 4);
 	goto out;
 
 normal_copy:
-	wcsncpy(out, inadj, 32768);
+	wcsncpy(out, inadj, path_buf_size);
 	if (!wcsncmp(out, L"\\\\?\\", 4))
 		memmove(out, out + 4, (lstrlenW(out) + 1 - 4) * sizeof(wchar_t));
 out:
-	out[32767] = L'\0';
-	if (tmpout)
+	out[path_buf_size - 1] = L'\0';
+	if (allocated_tmpout && tmpout)
 		free(tmpout);
-	if (nonexistent)
+	if (allocated_nonexistent && nonexistent)
 		free(nonexistent);
 	if (out[1] == L':' && out[2] == L'\\')
 		out[0] = toupper(out[0]);
@@ -1343,15 +1525,27 @@ wchar_t *get_full_key_pathW(HKEY registry, const wchar_t *in, PKEY_NAME_INFORMAT
 	wchar_t *u;
 	wchar_t *ret;
 	unsigned short idx = 0;
+	wchar_t stack_buf[1024];
+	size_t in_len = in ? wcslen(in) : 0;
+	unsigned int max_capacity = MAX_KEY_BUFLEN;
+	BOOL allocated = FALSE;
 
 	memset(&objattr, 0, sizeof(objattr));
 
-	keystr.Buffer = calloc(1, MAX_KEY_BUFLEN);
-	keystr.MaximumLength = MAX_KEY_BUFLEN;
+	if (in_len < 1000) {
+		keystr.Buffer = stack_buf;
+		keystr.MaximumLength = sizeof(stack_buf);
+		max_capacity = sizeof(stack_buf);
+		memset(stack_buf, 0, sizeof(stack_buf));
+	} else {
+		keystr.Buffer = calloc(1, MAX_KEY_BUFLEN);
+		keystr.MaximumLength = MAX_KEY_BUFLEN;
+		allocated = TRUE;
+	}
 	objattr.ObjectName = &keystr;
 
 	if (in) {
-		for (p = in, u = keystr.Buffer; *p && idx < (MAX_KEY_BUFLEN / sizeof(wchar_t) - 1); p++, u++, idx++) {
+		for (p = in, u = keystr.Buffer; *p && idx < (max_capacity / sizeof(wchar_t) - 1); p++, u++, idx++) {
 			*u = *p;
 			// normalize duplicate backslashes in the user-provided string as the registry APIs will use them without error
 			if (*p == L'\\') {
@@ -1369,7 +1563,9 @@ wchar_t *get_full_key_pathW(HKEY registry, const wchar_t *in, PKEY_NAME_INFORMAT
 	objattr.RootDirectory = registry;
 
 	ret = get_key_path(&objattr, keybuf, len);
-	free(keystr.Buffer);
+	if (allocated && keystr.Buffer) {
+		free(keystr.Buffer);
+	}
 	return ret;
 }
 
@@ -1688,57 +1884,6 @@ out:
 	return ret;
 }
 
-BOOLEAN is_suspended(DWORD pid, DWORD tid)
-{
-	ULONG length;
-	PSYSTEM_PROCESS_INFORMATION pspi = NULL, proc;
-	ULONG requestedlen = 16384;
-	lasterror_t lasterror;
-	BOOLEAN ret = FALSE;
-
-	get_lasterrors(&lasterror);
-
-	pspi = malloc(requestedlen);
-	if (pspi == NULL)
-		goto out;
-
-	while (pNtQuerySystemInformation(SystemProcessInformation, pspi, requestedlen, &length) == STATUS_INFO_LENGTH_MISMATCH) {
-		free(pspi);
-		requestedlen <<= 1;
-		pspi = malloc(requestedlen);
-		if (pspi == NULL)
-			goto out;
-	}
-	// now we have a valid list of process information
-	proc = pspi;
-	while (1) {
-		ULONG i;
-
-		if ((DWORD)(ULONG_PTR)proc->UniqueProcessId != pid)
-			goto next;
-		for (i = 0; i < proc->NumberOfThreads; i++) {
-			PSYSTEM_THREAD thread = &proc->Threads[i];
-			if (tid && (DWORD)(ULONG_PTR)thread->ClientId.UniqueThread != tid)
-				continue;
-			if (thread->WaitReason != Suspended)
-				goto out;
-		}
-		break;
-next:
-		if (!proc->NextEntryOffset)
-			break;
-		proc = (PSYSTEM_PROCESS_INFORMATION)((PCHAR)proc + proc->NextEntryOffset);
-	}
-	ret = TRUE;
-out:
-	if (pspi)
-		free(pspi);
-
-	set_lasterrors(&lasterror);
-
-	return ret;
-}
-
 static PUCHAR get_rel_target(PUCHAR buf)
 {
 	return buf + 5 + *(int *)&buf[1];
@@ -1846,6 +1991,29 @@ static BOOL get_section_bounds(HMODULE mod, const char * sectionname, PUCHAR *st
 			continue;
 		*start = buf + sechdr[i].VirtualAddress;
 		*end = *start + sechdr[i].Misc.VirtualSize;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static BOOL get_section_file_bounds(HMODULE mod, const char * sectionname, PUCHAR *start, PUCHAR *end)
+{
+	PUCHAR buf = (PUCHAR)mod;
+	PIMAGE_DOS_HEADER doshdr;
+	PIMAGE_NT_HEADERS nthdr;
+	PIMAGE_SECTION_HEADER sechdr;
+	unsigned int numsecs, i;
+
+	doshdr = (PIMAGE_DOS_HEADER)buf;
+	nthdr = (PIMAGE_NT_HEADERS)(buf + doshdr->e_lfanew);
+	sechdr = (PIMAGE_SECTION_HEADER)((PUCHAR)&nthdr->OptionalHeader + nthdr->FileHeader.SizeOfOptionalHeader);
+	numsecs = nthdr->FileHeader.NumberOfSections;
+
+	for (i = 0; i < numsecs; i++) {
+		if (memcmp(sechdr[i].Name, sectionname, strlen(sectionname)))
+			continue;
+		*start = buf + sechdr[i].PointerToRawData;
+		*end = *start + sechdr[i].SizeOfRawData;
 		return TRUE;
 	}
 	return FALSE;
@@ -2238,40 +2406,6 @@ BOOLEAN is_image_base_remapped(HMODULE BaseAddress)
 	return remapped;
 }
 
-ULONG_PTR win32u_base;
-DWORD win32u_size;
-
-BOOLEAN is_address_in_win32u(ULONG_PTR address)
-{
-	if (!win32u_base)
-		return FALSE;
-
-	if (!win32u_size)
-		win32u_size = get_image_size(win32u_base);
-
-	if (address >= win32u_base && address < (win32u_base + win32u_size))
-		return TRUE;
-
-	return FALSE;
-}
-
-ULONG_PTR user32_base;
-DWORD user32_size;
-
-BOOLEAN is_address_in_user32(ULONG_PTR address)
-{
-	if (!user32_base)
-		return FALSE;
-
-	if (!user32_size)
-		user32_size = get_image_size(user32_base);
-
-	if (address >= user32_base && address < (user32_base + user32_size))
-		return TRUE;
-
-	return FALSE;
-}
-
 BOOLEAN prevent_module_unloading(PVOID BaseAddress) {
 	// Some code may attempt to unmap a previously mapped view of, say, ntdll
 	// e.g. Xenos dll injector (https://github.com/DarthTon/Xenos - def1c2f12307d598e42506a55f1a06ed5e652af0d260aac9572469429f10d04d)
@@ -2328,4 +2462,144 @@ void prevent_module_reloading(PVOID *BaseAddress) {
 	}
 
 	free(absolutepath);
+}
+
+void prevent_module_unhooking(PVOID buffer, wchar_t *filename)
+{
+	PUCHAR file_start = NULL, file_end = NULL, mem_start = NULL, mem_end = NULL;
+
+	wchar_t *whitelist[] = {
+#ifdef _WIN64
+		L"\\Device\\HarddiskVolume2\\Windows\\System32\\ntdll.dll",
+#else
+		L"\\Device\\HarddiskVolume2\\Windows\\SysWOW64\\ntdll.dll",
+#endif
+		NULL
+	};
+
+	for (int i = 0; whitelist[i]; i++) {
+		if (!wcsicmp(whitelist[i], filename)) {
+			get_section_file_bounds(buffer, ".text", &file_start, &file_end);
+			break;
+		}
+	}
+
+	if (!file_start)
+		return;
+
+	if (!get_section_bounds((HMODULE)ntdll_base, ".text", &mem_start, &mem_end))
+		return;
+
+	memcpy(file_start, mem_start, (unsigned int)(file_end - file_start));
+}
+
+static size_t append_octet(char** p, size_t* remaining, unsigned char octet) {
+	char* start = *p;
+	size_t written_chars = 0;
+
+	// A temporary buffer to hold the characters of the octet (max 3 chars for 0-255)
+	char temp_buffer[3];
+	int i = 0;
+
+	// Handle 0
+	if (octet == 0) {
+		temp_buffer[i++] = '0';
+	}
+	else {
+		// Extract digits in reverse order
+		unsigned char val = octet;
+		while (val > 0) {
+			temp_buffer[i++] = (val % 10) + '0';
+			val /= 10;
+		}
+	}
+
+	// Write the digits to the destination buffer in the correct order
+	written_chars = i;
+	if (*remaining <= written_chars) { // Check if there's enough space (including null terminator)
+		return 0;
+	}
+
+	while (i > 0) {
+		*(*p)++ = temp_buffer[--i];
+	}
+
+	*remaining -= written_chars;
+	return written_chars;
+}
+
+const char* our_inet_ntop(int af, const void* src, char* dst, size_t size) {
+	if (src == NULL || dst == NULL) {
+		return NULL;
+	}
+
+	if (af != AF_INET) {
+		return NULL;
+	}
+
+	if (size < OUR_INET_ADDRSTRLEN) {
+		return NULL;
+	}
+
+	// Cast the source to a pointer to raw bytes (unsigned char).
+	const unsigned char* p_addr = (const unsigned char*)src;
+	char* p = dst;
+	size_t remaining = size;
+
+	for (int i = 0; i < 4; ++i) {
+		// Read the i-th byte directly from memory. This avoids all endianness problems.
+		unsigned char octet = p_addr[i];
+		if (append_octet(&p, &remaining, octet) == 0) {
+			return NULL;
+		}
+
+		if (i < 3) {
+			if (remaining <= 1) {
+				return NULL;
+			}
+			*p++ = '.';
+			remaining--;
+		}
+	}
+
+	*p = '\0';
+	return dst;
+}
+
+unsigned short our_ntohs(unsigned short netshort) {
+	return (netshort >> 8) | (netshort << 8);
+}
+
+DWORD wait_for_event_to_be_signaled(HANDLE hEvent, DWORD dwTimeout) {
+	ULONGLONG startTime = raw_gettickcount();
+	ULONGLONG currentTime;
+	NTSTATUS status;
+	EVENT_BASIC_INFORMATION eventInfo;
+	ULONG returnLength;
+
+	while (TRUE) {
+		status = pNtQueryEvent(hEvent, EventBasicInformation, &eventInfo, sizeof(eventInfo), &returnLength);
+		if (status == STATUS_SUCCESS) {
+			// Check the state. 1 means signaled.
+			if (eventInfo.EventState == 1) {
+				return WAIT_OBJECT_0;
+			}
+		}
+
+		// Check for timeout.
+		currentTime = raw_gettickcount();
+		if ((currentTime - startTime) > dwTimeout) {
+			return WAIT_TIMEOUT;
+		}
+
+		raw_sleep(250);
+	}
+}
+
+void* gettib() {
+#ifdef _WIN64
+    return (void *)__readgsqword(0);
+#else
+    return (void *)__readfsdword(0);
+#endif
 }

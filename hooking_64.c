@@ -170,22 +170,46 @@ static int addr_is_in_range(ULONG_PTR addr, const unsigned char *buf, DWORD size
 	return 0;
 }
 
-static void retarget_rip_relative_displacement(unsigned char **tramp, unsigned char **addr, _DInst *insn)
+static void retarget_relative_displacement(unsigned char **tramp, unsigned char **addr, _DInst *insn)
 {
 	unsigned short length = insn->size;
-	unsigned char offset = (unsigned char)(length - insn->imm_encoded_size - sizeof(int));
 	unsigned char *newtramp = *tramp;
 	unsigned char *newaddr = *addr;
-	ULONG_PTR target;
-	int rel = *(int *)(newaddr + offset);
-	target = (ULONG_PTR)(newaddr + length + rel);
-	// copy the instruction directly to the trampoline
-	while (length-- != 0) {
-		*newtramp++ = *newaddr++;
+
+	unsigned char offset = (unsigned char)(length - insn->imm_encoded_size - sizeof(int));
+	ULONG_PTR target = (ULONG_PTR)(newaddr + length + *(int *)(newaddr + offset));
+	int64_t rel = (int64_t)(target - (ULONG_PTR)(newtramp + length));
+
+	if (rel >= INT_MIN && rel <= INT_MAX) {
+		while (length-- != 0)
+			*newtramp++ = *newaddr++;
+		*(int *)(newtramp - insn->imm_encoded_size - sizeof(int)) = (int)rel;
 	}
-	// now replace the displacement
-	rel = (int)(target - (ULONG_PTR)newtramp);
-	*(int *)(newtramp - insn->imm_encoded_size - sizeof(int)) = rel;
+	else {
+		// mov r11, far target
+		*((WORD*)newtramp)++ = 0xBB49;
+		*((ULONG_PTR *)newtramp)++ = (ULONG_PTR)target;
+		if (*newaddr == 0xE8) {
+			// replace call near target with call far r11
+			*((WORD*)newtramp)++ = 0xFF41;
+			*newtramp++ = 0xD3;
+		}
+		else if (*newaddr == 0xE9) {
+			// replace jmp near target with jmp far r11
+			*((WORD*)newtramp)++ = 0xFF41;
+			*newtramp++ = 0xE3;
+		}
+		else if (insn->flags & FLAG_RIP_RELATIVE) {
+			// rewrite instruction to use rll
+			if ((*newaddr & 0xF0) == 0x40)
+				// modify REX prefix to use r11
+				*newtramp++ = *newaddr++ | 0x41;
+			*newtramp++ = *newaddr++;
+			// modify ModR/M byte to use R11
+			*newtramp++ = (*newaddr++ & 0xF8) | 3;
+		}
+		newaddr += 4;
+	}
 
 	*tramp = newtramp;
 	*addr = newaddr;
@@ -234,13 +258,11 @@ static int hook_create_trampoline(unsigned char *addr, int len,
 		// addresses, otherwise we can simply copy the instruction to our
 		// trampoline
 
-		if (addr[0] == 0xe8 || addr[0] == 0xe9 || (addr[0] == 0x0f && addr[1] >= 0x80 && addr[1] < 0x90) ||
-			(insn->flags & FLAG_RIP_RELATIVE)) {
-			retarget_rip_relative_displacement(&tramp, &addr, insn);
+		if (addr[0] == 0xe8 || addr[0] == 0xe9 || (addr[0] == 0x0f && addr[1] >= 0x80 && addr[1] < 0x90) || (insn->flags & FLAG_RIP_RELATIVE)) {
+			retarget_relative_displacement(&tramp, &addr, insn);
 			if (addr[0] == 0xe9 && len > 0)
 				goto error;
 		}
-
 		else if (addr[0] == 0xeb) {
 			target = get_short_rel_target(addr);
 			if (addr_is_in_range(target, origaddr, stoleninstrlen))
@@ -259,9 +281,8 @@ static int hook_create_trampoline(unsigned char *addr, int len,
 		}
 		// return instruction, indicates end of basic block as well, so we
 		// have to check if we already have enough space for our hook..
-		else if ((addr[0] == 0xc3 || addr[0] == 0xc2) && len > 0) {
+		else if ((addr[0] == 0xc3 || addr[0] == 0xc2) && len > 0)
 			goto error;
-		}
 		else {
 			// copy the instruction directly to the trampoline
 			while (length-- != 0) {
@@ -272,9 +293,9 @@ static int hook_create_trampoline(unsigned char *addr, int len,
 	}
 
 	// append a jump from the trampoline to the original function
-	*tramp++ = 0xe9;
-	emit_rel(tramp, tramp, addr);
-	tramp += 4;
+	*((WORD*)tramp)++ = 0x25FF;
+	*((DWORD*)tramp)++ = 0;
+	*((uintptr_t*)tramp)++ = (uintptr_t)addr;
 
 	// return the length of this trampoline
 	return (int)(tramp - base);
@@ -566,7 +587,7 @@ static void hook_create_pre_tramp_notail(hook_t *h)
 	unsigned char pre_tramp2[] = {
 		// test eax, eax
 		0x85, 0xc0,
-		// jnz 0x21
+		// jnz 0x21 -> pre_tramp3_nostack
 		0x75, 0x21,
 		// add rsp, 0x20
 		0x48, 0x83, 0xc4, 0x20,
@@ -645,7 +666,7 @@ static void hook_create_pre_tramp_notail(hook_t *h)
 	unsigned char pre_tramp4_nostack[] = {
 		// test eax, eax
 		0x85, 0xc0,
-		// jnz 0x21
+		// jnz 0x21 -> pre_tramp4_stack
 		0x75, 0x21,
 		// add rsp, 0x20 (from pre_tramp12)
 		0x48, 0x83, 0xc4, 0x20,
@@ -665,7 +686,7 @@ static void hook_create_pre_tramp_notail(hook_t *h)
 	unsigned char pre_tramp4_stack[] = {
 		// test eax, eax
 		0x85, 0xc0,
-		// jnz 0x3c
+		// jnz 0x3c -> pre_tramp5_nostack
 		0x75, 0x3c,
 		// mov eax, numargs
 		0xb8, h->numargs, 0x00, 0x00, 0x00,
@@ -833,11 +854,56 @@ static int hook_api_native_jmp_indirect(hook_t *h, unsigned char *from,
 	return hook_api_jmp_indirect(h, from, to);
 }
 
+static int hook_api_push_retn(hook_t *h, unsigned char *from, unsigned char *to)
+{
+	// push addr
+	*from++ = 0x68;
+	*(DWORD *) from = (DWORD)(DWORD_PTR)to;
+
+	// retn
+	from[4] = 0xc3;
+
+	memcpy(h->hookdata->hook_data, &to, sizeof(to));
+	return 0;
+}
+
+static int hook_api_native_push_retn(hook_t *h, unsigned char *from, unsigned char *to)
+{
+	from += 8;
+	return hook_api_push_retn(h, from, to);
+}
+
+typedef struct _hook_page_arena_t {
+	PVOID BaseAddress;
+	SIZE_T CommittedSize;
+	SIZE_T NextFreeOffset;
+	struct _hook_page_arena_t *next;
+} hook_page_arena_t;
+
+static hook_page_arena_t *g_hook_arenas = NULL;
+
 hook_data_t *alloc_hookdata_near(void *addr)
 {
+	hook_page_arena_t *curr = g_hook_arenas;
+	SIZE_T requested_size = sizeof(hook_data_t);
+
+	// 1. Scan current arenas for an existing chunk within 1GB of 'addr' with free slots
+	while (curr != NULL) {
+		LONG_PTR distance = (LONG_PTR)curr->BaseAddress - (LONG_PTR)addr;
+		if (distance >= -((LONG_PTR)1024*1024*1024) && distance <= ((LONG_PTR)1024*1024*1024)) {
+			if (curr->NextFreeOffset + requested_size <= curr->CommittedSize) {
+				hook_data_t *allocated = (hook_data_t *)((PBYTE)curr->BaseAddress + curr->NextFreeOffset);
+				curr->NextFreeOffset += requested_size;
+				return allocated;
+			}
+		}
+		curr = curr->next;
+	}
+
+	// 2. No matching arena block. Perform search to allocate a new 64KB arena near 'addr'
 	PVOID BaseAddress;
-	int offset = -(1024 * 1024 * 1024);
-	SIZE_T RegionSize = sizeof(hook_data_t);
+	int offset = -(512 * 1024 * 1024); // Start closer (512MB) for optimal results
+	SIZE_T RegionSize = 65536; // Allocate a standard 64KB page chunk
 	LONG status;
 
 	do {
@@ -845,10 +911,41 @@ hook_data_t *alloc_hookdata_near(void *addr)
 			offset = 0x10000;
 		BaseAddress = (PCHAR)addr + offset;
 		status = pNtAllocateVirtualMemory(GetCurrentProcess(), &BaseAddress, 0, &RegionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+		if (status >= 0) {
+			// Place the metadata directly at the beginning of the newly allocated page
+			hook_page_arena_t *new_arena = (hook_page_arena_t *)BaseAddress;
+			new_arena->BaseAddress = BaseAddress;
+			new_arena->CommittedSize = RegionSize;
+			
+			// NextFreeOffset starts after metadata (128-byte aligned for performance and safety)
+			new_arena->NextFreeOffset = 128;
+			
+			new_arena->next = g_hook_arenas;
+			g_hook_arenas = new_arena;
+			
+			hook_data_t *allocated = (hook_data_t *)((PBYTE)new_arena->BaseAddress + new_arena->NextFreeOffset);
+			new_arena->NextFreeOffset += requested_size;
+			return allocated;
+		}
+		offset += 0x10000;
+	} while (status < 0 && offset <= (512 * 1024 * 1024));
+
+	return NULL;
+}
+
+hook_data_t *alloc_hookdata_low()
+{
+	PCHAR BaseAddress = (PCHAR)0x10000;
+	int offset = 0x10000;
+	SIZE_T RegionSize = sizeof(hook_data_t);
+	LONG status;
+
+	do {
+		status = pNtAllocateVirtualMemory(GetCurrentProcess(), (PVOID)&BaseAddress, 0, &RegionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 		if (status >= 0)
 			return (hook_data_t *)BaseAddress;
-		offset += 0x10000;
-	} while (status < 0 && offset <= (1024 * 1024 * 1024));
+		BaseAddress += offset;
+	} while (status < 0);
 
 	return NULL;
 }
@@ -915,7 +1012,9 @@ int hook_api(hook_t *h, int type)
 		int len;
 	} hook_types[] = {
 		/* HOOK_NATIVE_JMP_INDIRECT */{ &hook_api_native_jmp_indirect, 14 },
+		/* HOOK_NATIVE_PUSH_RETN */{ &hook_api_native_push_retn, 14 },
 		/* HOOK_JMP_INDIRECT */{ &hook_api_jmp_indirect, 6 },
+		/* HOOK_PUSH_RETN */{ &hook_api_push_retn, 6 },
 	};
 
 	// is this address already hooked?
@@ -975,28 +1074,29 @@ int hook_api(hook_t *h, int type)
 				addr = (unsigned char *)get_vbscript_addr(hmod, (PCHAR)h->funcname);
 		}
 		else {
-			PVOID exportaddr = GetFunctionAddress(hmod, (PCHAR)h->funcname);
 			addr = (unsigned char *)GetProcAddress(hmod, h->funcname);
+			PVOID exportaddr = GetFunctionAddress(hmod, (PCHAR)h->funcname);
 			if (exportaddr && addr && (PVOID)addr != exportaddr) {
-				unsigned int offset;
-				char *module_name = convert_address_to_dll_name_and_offset((ULONG_PTR)addr, &offset);
-				DebugOutput("hook_api: Warning - %s export address 0x%p differs from GetProcAddress -> 0x%p (%s::0x%x)\n", h->funcname, exportaddr, addr, module_name, offset);
+				unsigned int offset = (unsigned int)((ULONG_PTR)addr - (ULONG_PTR)hmod);
+				UNICODE_STRING *module_name = get_module_name((ULONG_PTR)addr);
+				DebugOutput("hook_api: Warning - %s export address 0x%p differs from GetProcAddress -> 0x%p (%wZ::0x%x)\n", h->funcname, exportaddr, addr, module_name, offset);
 			}
 			else if (exportaddr && !addr) {
 				addr = exportaddr;
 				if  (!wcscmp(h->library, L"clrjit"))
 					DebugOutput("hook_api: clrjit::%s export address 0x%p obtained via GetFunctionAddress\n", h->funcname, addr);
-				else
-					DebugOutput("hook_api: %s export address 0x%p obtained via GetFunctionAddress\n", h->funcname, addr);
 			}
 		}
-
-		if (addr == NULL && h->timestamp != 0 && h->rva != 0) {
-			DWORD timestamp = GetTimeStamp(hmod);
-			if (timestamp == h->timestamp)
-				addr = (unsigned char *)hmod + h->rva;
-		}
 	}
+
+	if (addr == NULL && h->timestamp != 0 && h->rva != 0) {
+		if (!hmod)
+			hmod = GetModuleHandleW(h->library);
+		DWORD timestamp = GetTimeStamp(hmod);
+		if (timestamp == h->timestamp)
+			addr = (unsigned char *)hmod + h->rva;
+	}
+
 	if (addr == NULL) {
 		// function doesn't exist in this DLL, not a critical error
 		return 0;
@@ -1040,12 +1140,15 @@ int hook_api(hook_t *h, int type)
 
 	addr = handle_stub(h, addr);
 
-	if (!wcscmp(h->library, L"ntdll") && !memcmp(addr, "\x4c\x8b\xd1\xb8", 4) && memcmp(addr+8, "\x0f\x05", 2)) {
+	if (h->library && !wcscmp(h->library, L"ntdll") && !memcmp(addr, "\x4c\x8b\xd1\xb8", 4) && memcmp(addr+8, "\x0f\x05", 2)) {
 		// hooking a native API, leave in the mov eax, <syscall nr> instruction
 		// as some malware depends on this for direct syscalls
 		// missing a few syscalls is better than crashing and getting no information
 		// at all
-		type = HOOK_NATIVE_JMP_INDIRECT;
+		if (type == HOOK_PUSH_RETN)
+			type = HOOK_NATIVE_PUSH_RETN;
+		else
+			type = HOOK_NATIVE_JMP_INDIRECT;
 	}
 
 	// check if this is a valid hook type
@@ -1060,51 +1163,43 @@ int hook_api(hook_t *h, int type)
 		return 0;
 
 	// make the address writable
-	if (VirtualProtect(addr, hook_types[type].len, PAGE_EXECUTE_READWRITE,
-		&old_protect)) {
-
-		h->hookdata = alloc_hookdata_near(addr);
-
-		if (h->hookdata && hook_create_trampoline(addr, hook_types[type].len, h->hookdata->tramp)) {
-			//hook_store_exception_info(h);
-			uint8_t orig[16];
-			memcpy(orig, addr, 16);
-
-			if (h->notail)
-				hook_create_pre_tramp_notail(h);
-			else
-				hook_create_pre_tramp(h);
-
-			// insert the hook (jump from the api to the
-			// pre-trampoline)
-			ret = hook_types[type].hook(h, addr, h->hookdata->pre_tramp);
-
-			// Add unhook detection for our newly created hook.
-			unhook_detect_add_region(h, addr, orig, addr, hook_types[type].len);
-
-			// if successful, assign the trampoline address to *old_func
-			if (ret == 0) {
-				// This will be NULL in cases where we don't care to call the original function from our hook (NOTAIL)
-				if (h->old_func)
-					*h->old_func = h->hookdata->tramp;
-
-				// hook is successful
-				h->is_hooked = 1;
-				h->hook_addr = addr;
-				add_dll_range((ULONG_PTR)hmod, (ULONG_PTR)hmod + GetAllocationSize(hmod));
-			}
-		}
-		else {
-			pipe("WARNING:Unable to place hook on %z", h->funcname);
-		}
-
-		// restore the old protection
-		VirtualProtect(addr, hook_types[type].len, old_protect,
-			&old_protect);
-	}
-	else {
+	if (!VirtualProtect(addr, hook_types[type].len, PAGE_EXECUTE_READWRITE, &old_protect)) {
 		pipe("WARNING:Unable to change protection for hook on %z", h->funcname);
+		return 0;
 	}
+
+	h->hookdata = alloc_hookdata_near(addr);
+	if (!h->hookdata) {
+		pipe("WARNING:Unable to allocate hook data for %z, type %d", h->funcname, type);
+		goto restore_protect;
+	}
+
+	if (!hook_create_trampoline(addr, hook_types[type].len, h->hookdata->tramp)) {
+		pipe("WARNING:Unable to create trampoline for %z, hook type %d", h->funcname, type);
+		goto restore_protect;
+	}
+
+	uint8_t orig[16];
+	memcpy(orig, addr, 16);
+
+	if (h->notail)
+		hook_create_pre_tramp_notail(h);
+	else
+		hook_create_pre_tramp(h);
+
+	ret = hook_types[type].hook(h, addr, h->hookdata->pre_tramp);
+	unhook_detect_add_region(h, addr, orig, addr, hook_types[type].len);
+
+	if (ret == 0) {
+		if (h->old_func)
+			*h->old_func = h->hookdata->tramp;
+		h->is_hooked = 1;
+		h->hook_addr = addr;
+		add_dll_range((ULONG_PTR)hmod, (ULONG_PTR)hmod + GetAllocationSize(hmod));
+	}
+
+restore_protect:
+	VirtualProtect(addr, hook_types[type].len, old_protect, &old_protect);
 
 	return ret;
 }
@@ -1158,6 +1253,8 @@ static int our_stackwalk(ULONG_PTR _rip, ULONG_PTR sp, PVOID *backtrace, unsigne
 			runfunc = RtlLookupFunctionEntry(ctx.Rip, &imgbase, NULL);	// needs LdrpInvertedFunctionTableSRWLock on Win10
 			memset(&nvctx, 0, sizeof(nvctx));
 			if (runfunc == NULL) {
+				if (our_isbadreadptr((PVOID)ctx.Rsp, sizeof(PVOID)))
+					break;
 				ctx.Rip = (ULONG_PTR)(*(ULONG_PTR *)ctx.Rsp);
 				ctx.Rsp += 8;
 			}
@@ -1172,7 +1269,12 @@ static int our_stackwalk(ULONG_PTR _rip, ULONG_PTR sp, PVOID *backtrace, unsigne
 	}
 	__except(EXCEPTION_EXECUTE_HANDLER)
 	{
-		return -1;
+		// If unwinding fails/raises an exception (common with Golang binaries due to their 
+		// custom runtime stack and non-standard 'asmstdcall' assembly gate), we must return the 
+		// count of successfully resolved frames. This ensures the first frame (which points 
+		// to the Go binary calling the API, not Capemon) is kept, so operate_on_backtrace correctly 
+		// detects it as an application call rather than a recursive hook call, allowing logging.
+		return (int)frame + 1;
 	}
 }
 
@@ -1187,6 +1289,10 @@ int operate_on_backtrace(ULONG_PTR sp, ULONG_PTR _rip, void *extra, int(*func)(v
 	hook_disable();
 
 	frames = our_stackwalk(_rip, sp, backtrace, HOOK_BACKTRACE_DEPTH);
+	if (frames > HOOK_BACKTRACE_DEPTH)
+		frames = HOOK_BACKTRACE_DEPTH;
+	else if (frames < 0)
+		frames = 0;
 
 	for (i = 0; i < frames; i++) {
 		if (!addr_in_our_dll_range(NULL, (ULONG_PTR)backtrace[i]))

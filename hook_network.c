@@ -26,11 +26,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "config.h"
 #include "misc.h"
 
+#define NERR_Success 0
+
+#pragma comment(lib, "Netapi32.lib")
+
 extern unsigned int dropped_count;
 extern BOOL DumpRegion(PVOID Address);
 extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 
 static int did_initial_request;
+
+WINAPI NetApiBufferAllocate(DWORD ByteCount, LPVOID *Buffer);
 
 HOOKDEF(DWORD, WINAPI, InternetConfirmZoneCrossingA,
 	_In_ HWND hWnd,
@@ -274,7 +280,7 @@ HOOKDEF(HRESULT, WINAPI, URLDownloadToFileW,
 	HRESULT ret = Old_URLDownloadToFileW(pCaller, szURL, szFileName, dwReserved, lpfnCB);
 	LOQ_hresult("network", "uFs", "URL", szURL, "FileName", szFileName, "StackPivoted", is_stack_pivoted() ? "yes" : "no");
 	if (ret == S_OK && dropped_count < g_config.dropped_limit) {
-		pipe("FILE_NEW:%Z", szFileName);
+		pipe("FILE_NEW:%d,%Z", GetCurrentProcessId(), szFileName);
 		dropped_count++;
 	}
 
@@ -292,7 +298,7 @@ HOOKDEF(HRESULT, WINAPI, URLDownloadToCacheFileW,
 	HRESULT ret = Old_URLDownloadToCacheFileW(lpUnkcalled, szURL, szFilename, cchFilename, dwReserved, pBSC);
 	LOQ_hresult("network", "uFs", "URL", szURL, "Filename", ret == S_OK ? szFilename : L"", "StackPivoted", is_stack_pivoted() ? "yes" : "no");
 	if (ret == S_OK && dropped_count < g_config.dropped_limit) {
-		pipe("FILE_NEW:%Z", szFilename);
+		pipe("FILE_NEW:%d,%Z", GetCurrentProcessId(), szFilename);
 		dropped_count++;
 	}
 
@@ -989,14 +995,32 @@ HOOKDEF(DWORD, WINAPI, GetAdaptersInfo,
 }
 
 HOOKDEF(ULONG, WINAPI, NetGetJoinInformation,
-	_In_  LPCWSTR			   lpServer,
-	_Out_ LPWSTR				*lpNameBuffer,
-	_Out_ DWORD *				BufferType
+    _In_  LPCWSTR   lpServer,
+    _Out_ LPWSTR   *lpNameBuffer,
+    _Out_ DWORD    *BufferType
 ) {
 	ULONG ret = Old_NetGetJoinInformation(lpServer, lpNameBuffer, BufferType);
-
-	LOQ_zero("network", "uuI", "Server", lpServer, "NetBIOSName", *lpNameBuffer, "JoinStatus", BufferType);
-
+	if (ret != 0) {
+		LOQ_zero("network", "u", "Server", lpServer, "NetBIOSName");
+		return ret;
+	}
+	if (g_config.no_stealth)
+		LOQ_zero("network", "uuI", "Server", lpServer, "NetBIOSName", *lpNameBuffer, "JoinStatus", BufferType);
+	else {
+		// Spoof domain membership to bypass sandbox detections
+		if (*BufferType != 3) {
+			*BufferType = 3;
+			LPCWSTR fake_domain_name = L"myDomain";
+			DWORD len = (DWORD)((wcslen(fake_domain_name) + 1) * sizeof(WCHAR));
+			LPWSTR buf = NULL;
+			// caller frees via NetApiBufferFree per API contract
+			if (NetApiBufferAllocate(len, (LPVOID *)&buf) == NERR_Success) {
+				memcpy(buf, fake_domain_name, len);
+				*lpNameBuffer = buf;
+			}
+		}
+		LOQ_zero("network", "uuI", "Server", lpServer, "NetBIOSName", *lpNameBuffer, "JoinStatus", BufferType);
+	}
 	return ret;
 }
 
@@ -1056,5 +1080,27 @@ HOOKDEF(HRESULT, WINAPI, UrlCanonicalizeW,
 		LOQ_hresult("filesystem", "u", "Url", pszUrl);
 	else
 		LOQ_hresult("network", "u", "Url", pszUrl);
+	return ret;
+}
+
+HOOKDEF(HRESULT, WINAPI, MkParseDisplayName,
+	_In_  PVOID pbc,
+	_In_  LPWSTR szName,
+	_Out_ ULONG *pchEaten,
+	_Out_ PVOID ppmk
+) {
+	HRESULT ret = Old_MkParseDisplayName(pbc, szName, pchEaten, ppmk);
+	LOQ_hresult("network", "u", "Name", szName);
+	return ret;
+}
+
+HOOKDEF(HRESULT, WINAPI, MkParseDisplayNameEx,
+	_In_  PVOID pbc,
+	_In_  LPWSTR szName,
+	_Out_ ULONG *pchEaten,
+	_Out_ PVOID ppmk
+) {
+	HRESULT ret = Old_MkParseDisplayNameEx(pbc, szName, pchEaten, ppmk);
+	LOQ_hresult("network", "u", "Name", szName);
 	return ret;
 }

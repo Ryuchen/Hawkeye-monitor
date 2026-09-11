@@ -22,6 +22,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "ntapi.h"
 #include <tlhelp32.h>
 #include <ncrypt.h>
+#include "hook_trace.h"
+#include <Wbemidl.h>
+
+#pragma comment(lib, "wbemuuid.lib")
 
 //
 // File Hooks
@@ -1030,6 +1034,38 @@ HOOKDEF(BOOL, WINAPI, Module32NextW,
 	__out LPMODULEENTRY32W lpme
 );
 
+HOOKDEF(BOOL, WINAPI, Thread32First,
+	__in HANDLE hSnapshot,
+	__out LPTHREADENTRY32 lpme
+);
+
+HOOKDEF(BOOL, WINAPI, Thread32Next,
+	__in HANDLE hSnapshot,
+	__out LPTHREADENTRY32 lpme
+);
+
+HOOKDEF(BOOL, WINAPI, K32EnumProcesses,
+	_Out_writes_bytes_(cb)	DWORD*	lpidProcess,
+	_In_					DWORD	cb,
+	_Out_					LPDWORD	lpcbNeeded
+);
+
+HOOKDEF(BOOL, WINAPI, WTSEnumerateProcessesW,
+	_In_	HANDLE				hServer,
+	_In_	DWORD				Reserved,
+	_In_	DWORD				Version,
+	_Out_	PWTS_PROCESS_INFOW* ppProcessInfo,
+	_Out_	DWORD*				pCount
+);
+
+HOOKDEF(BOOL, WINAPI, WTSEnumerateProcessesExW,
+	_In_	HANDLE	hServer,
+	_Inout_	DWORD*	pLevel,
+	_In_	DWORD	SessionId,
+	_Out_	LPWSTR*	ppProcessInfo,
+	_Out_	DWORD*	pCount
+);
+
 HOOKDEF(UINT, WINAPI, WinExec,
 	__in LPCSTR lpCmdLine,
 	__in UINT   uCmdShow
@@ -1118,6 +1154,15 @@ HOOKDEF(NTSTATUS, WINAPI,  RtlReportSilentProcessExit,
 
 HOOKDEF(NTSTATUS, WINAPI, NtResumeProcess,
 	__in  HANDLE ProcessHandle
+);
+
+HOOKDEF(NTSTATUS, WINAPI, NtAdjustPrivilegesToken,
+    IN HANDLE               TokenHandle,
+    IN BOOLEAN              DisableAllPrivileges,
+    IN PTOKEN_PRIVILEGES    NewState OPTIONAL,
+    IN ULONG                BufferLength,
+    OUT PTOKEN_PRIVILEGES   PreviousState OPTIONAL,
+    OUT PULONG              ReturnLength OPTIONAL
 );
 
 HOOKDEF(NTSTATUS, WINAPI, NtCreateSection,
@@ -1260,6 +1305,111 @@ HOOKDEF(HRESULT, WINAPI, CoGetObject,
 	_In_		REFIID riid,
 	_Out_		LPVOID *ppv
 );
+
+// WMI Hooks
+HOOKDEF(HRESULT, WINAPI, WbemLocator_ConnectServer,
+	_In_	PVOID			_this,
+	_In_	const BSTR		strNetworkResource,
+	_In_	const BSTR		strUser,
+	_In_	const BSTR		strPassword,
+	_In_	const BSTR		strLocale,
+	_In_	long			lSecurityFlags,
+	_In_	const BSTR		strAuthority,
+	_In_	IWbemContext	*pCtx,
+	_Out_	IWbemServices	**ppNamespace
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_Get,
+	_In_		PVOID	_this,
+	_In_		LPCWSTR	wszName,
+	_In_		LONG	lFlags,
+	_Out_		VARIANT	*pVal,
+	_Out_opt_	CIMTYPE	*pType,
+	_Out_opt_	LONG	*plFlavor
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_Next,
+	_In_		PVOID	_this,
+	_In_		LONG	lFlags,
+	_Out_		BSTR	wszName,
+	_Out_		VARIANT	*pVal,
+	_Out_opt_	CIMTYPE	*pType,
+	_Out_opt_	LONG	*plFlavor
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_ExecQuery,
+	_In_	PVOID					_this,
+	_In_	const BSTR				strQueryLanguage,
+	_In_	const BSTR				strQuery,
+	_In_	LONG					lFlags,
+	_In_	IWbemContext			*pCtx,
+	_Out_	IEnumWbemClassObject	**ppEnum
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_ExecQueryAsync,
+	_In_	PVOID			_this,
+	_In_	const BSTR		strQueryLanguage,
+	_In_	const BSTR		strQuery,
+	_In_	LONG			lFlags,
+	_In_	IWbemContext	*pCtx,
+	_In_	IWbemObjectSink	*pResponseHandler
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_ExecMethod,
+	_In_	PVOID				_this,
+	_In_	const BSTR			strObjectPath,
+	_In_	const BSTR			strMethodName,
+	_In_	LONG				lFlags,
+	_In_	IWbemContext		*pCtx,
+	_In_	IWbemClassObject	*pInParams,
+	_Out_	IWbemClassObject	**ppOutParams,
+	_Out_	IWbemCallResult		**ppCallResult
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_ExecMethodAsync,
+	_In_	PVOID				_this,
+	_In_	const BSTR			strObjectPath,
+	_In_	const BSTR			strMethodName,
+	_In_	LONG				lFlags,
+	_In_	IWbemContext		*pCtx,
+	_In_	IWbemClassObject	*pInParams,
+	_In_	IWbemObjectSink		*pResponseHandler
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_GetObject,
+	_In_	PVOID				_this,
+	_In_	const BSTR			strObjectPath,
+	_In_	LONG				lFlags,
+	_In_	IWbemContext		*pCtx,
+	_Out_	IWbemClassObject	**ppObject,
+	_Out_	IWbemCallResult		**ppCallResult
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_GetObjectAsync,
+	_In_	PVOID			_this,
+	_In_	const BSTR		strObjectPath,
+	_In_	LONG			lFlags,
+	_In_	IWbemContext	*pCtx,
+	_In_	IWbemObjectSink	*pResultHandler
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_CreateInstanceEnum,
+	_In_	PVOID					_this,
+	_In_	const BSTR				strFilter,
+	_In_	long					lFlags,
+	_In_	IWbemContext			*pCtx,
+	_Out_	IEnumWbemClassObject	**ppEnum
+);
+
+HOOKDEF(HRESULT, WINAPI, WMI_CreateInstanceEnumAsync,
+	_In_	PVOID			_this,
+	_In_	const BSTR		strFilter,
+	_In_	long			lFlags,
+	_In_	IWbemContext	*pCtx,
+	_In_	IWbemObjectSink	*pResponseHandler
+);
+
+// End of WMI Hooks
 
 HOOKDEF(NTSTATUS, WINAPI, NtMapViewOfSection,
 	__in	 HANDLE SectionHandle,
@@ -1504,15 +1654,22 @@ HOOKDEF(NTSTATUS, WINAPI, NtGetContextThread,
 	__inout  LPCONTEXT Context
 );
 
+HOOKDEF(NTSTATUS, WINAPI, NtSetContextThread,
+	__in  HANDLE ThreadHandle,
+	__in  CONTEXT *Context
+);
+
+#ifdef _WIN64
 HOOKDEF(NTSTATUS, WINAPI, RtlWow64GetThreadContext,
 	__in	 HANDLE ThreadHandle,
 	__inout  PWOW64_CONTEXT Context
 );
 
-HOOKDEF(NTSTATUS, WINAPI, NtSetContextThread,
-	__in  HANDLE ThreadHandle,
-	__in  CONTEXT *Context
+HOOKDEF(NTSTATUS, WINAPI, RtlWow64SetThreadContext,
+	__in	 HANDLE ThreadHandle,
+	__inout  PWOW64_CONTEXT Context
 );
+#endif
 
 HOOKDEF(NTSTATUS, WINAPI, NtSuspendThread,
 	__in	   HANDLE ThreadHandle,
@@ -1564,6 +1721,11 @@ HOOKDEF(HANDLE, WINAPI, CreateRemoteThreadEx,
 	__out_opt	LPDWORD lpThreadId
 );
 
+HOOKDEF_NOTAIL(WINAPI, RtlUserThreadStart,
+	__in   LPTHREAD_START_ROUTINE lpStartAddress,
+	__in   LPVOID lpParameter
+);
+
 HOOKDEF(BOOL, WINAPI, TerminateThread,
 	__inout  HANDLE hThread,
 	__in	 DWORD dwExitCode
@@ -1584,6 +1746,15 @@ HOOKDEF(NTSTATUS, WINAPI, RtlCreateUserThread,
 
 HOOKDEF(BOOL, WINAPI, NtTestAlert,
 	VOID
+);
+
+HOOKDEF(BOOL, WINAPI, SetThreadStackGuarantee,
+	_Inout_	PULONG	StackSizeInBytes
+);
+
+HOOKDEF(NTSTATUS, WINAPI, SetThreadDescription,
+	_In_	HANDLE	hThread,
+	_In_	PCWSTR	lpThreadDescription
 );
 
 //
@@ -1664,9 +1835,17 @@ HOOKDEF(LPTOP_LEVEL_EXCEPTION_FILTER, WINAPI, SetUnhandledExceptionFilter,
 	_In_  LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter
 );
 
+HOOKDEF(LONG, WINAPI, UnhandledExceptionFilter,
+	__in PEXCEPTION_POINTERS ExceptionInfo
+);
+
 HOOKDEF(PVOID, WINAPI, RtlAddVectoredExceptionHandler,
 	__in	ULONG First,
 	__out   PVECTORED_EXCEPTION_HANDLER Handler
+);
+
+HOOKDEF(ULONG, WINAPI, RtlRemoveVectoredExceptionHandler,
+	__in	PVOID Handle
 );
 
 HOOKDEF(UINT, WINAPI, SetErrorMode,
@@ -1678,6 +1857,14 @@ HOOKDEF(NTSTATUS, WINAPI, LdrGetDllHandle,
 	__in_opt	PVOID Unused,
 	__in		PUNICODE_STRING ModuleFileName,
 	__out	   PHANDLE pHModule
+);
+
+HOOKDEF(NTSTATUS, WINAPI, LdrGetDllHandleEx,
+    __in ULONG Flags,
+    __in_opt PWSTR DllPath,
+    __in PULONG DllCharacteristics,
+    __in PUNICODE_STRING DllName,
+    __out_opt PVOID *DllHandle
 );
 
 HOOKDEF(NTSTATUS, WINAPI, LdrGetProcedureAddress,
@@ -1705,6 +1892,19 @@ HOOKDEF(BOOL, WINAPI, DeviceIoControl,
 	__in		 DWORD nOutBufferSize,
 	__out_opt	LPDWORD lpBytesReturned,
 	__inout_opt  LPOVERLAPPED lpOverlapped
+);
+
+HOOKDEF(UINT, WINAPI, GetSystemFirmwareTable,
+	_In_  DWORD FirmwareTableProviderSignature,
+	_In_  DWORD FirmwareTableID,
+	_Out_ PVOID FirmwareTableBuffer,
+	_In_  DWORD BufferSize
+);
+
+HOOKDEF(UINT, WINAPI, EnumSystemFirmwareTables,
+	_In_  DWORD FirmwareTableProviderSignature,
+	_Out_ PVOID FirmwareTableBuffer,
+	_In_  DWORD BufferSize
 );
 
 HOOKDEF(NTSTATUS, WINAPI, NtSetTimer,
@@ -1862,12 +2062,6 @@ HOOKDEF(BOOL, WINAPI, GetUserNameW,
 	_Inout_  LPDWORD lpnSize
 );
 
-HOOKDEF(void, WINAPIV, memcpy,
-   void *dest,
-   const void *src,
-   size_t count
-);   
-
 HOOKDEF(HDEVINFO, WINAPI, SetupDiGetClassDevsA,
 	_In_opt_ const GUID   *ClassGuid,
 	_In_opt_	   PCSTR Enumerator,
@@ -1958,6 +2152,10 @@ HOOKDEF(BOOL, WINAPI, GlobalMemoryStatusEx,
 	_Out_ LPMEMORYSTATUSEX lpBuffer
 );
 
+HOOKDEF(BOOL, WINAPI, GetPhysicallyInstalledSystemMemory,
+	_Out_ PULONGLONG TotalMemoryInKilobytes
+);
+
 HOOKDEF(BOOL, WINAPI, SystemParametersInfoA,
 	_In_	UINT  uiAction,
 	_In_	UINT  uiParam,
@@ -1979,9 +2177,23 @@ HOOKDEF(HRESULT, WINAPI, PStoreCreateInstance,
 	_In_  DWORD dwFlags
 );
 
+HOOKDEF(HANDLE, WINAPI, GetClipboardData,
+	_In_ UINT uFormat
+);
+
+HOOKDEF(BOOL, WINAPI, OpenClipboard,
+	_In_opt_ HWND hWndNewOwner
+);
+
+HOOKDEF(HANDLE, WINAPI, SetClipboardData,
+	_In_ UINT uFormat,
+	_In_opt_ HANDLE hMem
+);
+
 //
 // Network Hooks
 //
+
 HOOKDEF(DWORD, WINAPI, InternetConfirmZoneCrossingA,
 	_In_ HWND hWnd,
 	_In_ LPTSTR szUrlPrev,
@@ -2400,6 +2612,41 @@ HOOKDEF(DWORD, WINAPI, GetAdaptersInfo,
 	_Inout_ PULONG		   pOutBufLen
 );
 
+typedef ULONG IPAddr;
+
+typedef struct ip_option_information {
+  UCHAR  Ttl;
+  UCHAR  Tos;
+  UCHAR  Flags;
+  UCHAR  OptionsSize;
+  PUCHAR OptionsData;
+} IP_OPTION_INFORMATION, *PIP_OPTION_INFORMATION;
+
+HOOKDEF(DWORD, WINAPI, IcmpSendEcho,
+    _In_     HANDLE                 IcmpHandle,
+    _In_     IPAddr                 DestinationAddress,
+    _In_     LPVOID                 RequestData,
+    _In_     WORD                   RequestSize,
+    _In_opt_ PIP_OPTION_INFORMATION RequestOptions,
+    _Out_    LPVOID                 ReplyBuffer,
+    _In_     DWORD                  ReplySize,
+    _In_     DWORD                  Timeout
+);
+
+HOOKDEF(DWORD, WINAPI, IcmpSendEcho2,
+    _In_     HANDLE                 IcmpHandle,
+    _In_opt_ HANDLE                 Event,
+    _In_opt_ PVOID                  ApcRoutine,
+    _In_opt_ PVOID                  ApcContext,
+    _In_     IPAddr                 DestinationAddress,
+    _In_     LPVOID                 RequestData,
+    _In_     WORD                   RequestSize,
+    _In_opt_ PIP_OPTION_INFORMATION RequestOptions,
+    _Out_    LPVOID                 ReplyBuffer,
+    _In_     DWORD                  ReplySize,
+    _In_     DWORD                  Timeout
+);
+
 HOOKDEF(ULONG, WINAPI, NetGetJoinInformation,
 	_In_  LPCWSTR			   lpServer,
 	_Out_ LPWSTR				*lpNameBuffer,
@@ -2541,6 +2788,14 @@ HOOKDEF(NTSTATUS, WINAPI, NtWaitForSingleObject,
 	__in HANDLE Handle,
 	__in	BOOLEAN Alertable,
 	__in_opt	PLARGE_INTEGER Timeout
+);
+
+HOOKDEF(NTSTATUS, WINAPI, NtWaitForMultipleObjects,
+	_In_ ULONG Count,
+	_In_ HANDLE *Handles,
+	_In_ int WaitType,
+	_In_ BOOLEAN Alertable,
+	_In_opt_ PLARGE_INTEGER Timeout
 );
 
 HOOKDEF(void, WINAPI, GetLocalTime,
@@ -2974,6 +3229,13 @@ HOOKDEF(BOOL, WINAPI, CryptExportKey,
 	_Inout_  DWORD *pdwDataLen
 );
 
+HOOKDEF(BOOL, WINAPI, CryptDuplicateKey,
+	_In_	HCRYPTKEY	hKey,
+	_In_	DWORD* pdwReserved,
+	_In_	DWORD		dwFlags,
+	_Out_	HCRYPTKEY* phKey
+);
+
 HOOKDEF(BOOL, WINAPI, CryptDestroyKey,
 	_In_   HCRYPTKEY hKey
 );
@@ -3022,6 +3284,15 @@ HOOKDEF(HRESULT, WINAPI, HTTPSCertificateTrust,
 
 HOOKDEF(HRESULT, WINAPI, HTTPSFinalProv,
 	PVOID data // PCRYPT_PROVIDER_DATA
+);
+
+HOOKDEF(NTSTATUS, WINAPI, WTGetSignatureInfo,
+	_In_	LPWSTR	pszFile,
+	_In_	HANDLE	hFile,
+	_In_	DWORD	sigInfoFlags,
+	_Out_	PVOID	psiginfo,
+	_Out_	PVOID	ppCertContext,
+	_Out_	PVOID	phWVTStateData
 );
 
 HOOKDEF(BOOL, WINAPI, CryptDecodeObjectEx,
@@ -3138,6 +3409,276 @@ HOOKDEF(NTSTATUS, WINAPI, BCryptEncrypt,
 	ULONG				cbOutput,
 	ULONG				*pcbResult,
 	ULONG				dwFlags
+);
+
+HOOKDEF(NTSTATUS, WINAPI, BCryptHashData,
+	PVOID				hHash,
+	PUCHAR				pbInput,
+	ULONG				cbInput,
+	ULONG				dwFlags
+);
+
+HOOKDEF(NTSTATUS, WINAPI, BCryptKeyDerivation,
+	PVOID				hKey,
+	PNCryptBufferDesc	pParameterList,
+	PUCHAR				pbDerivedKey,
+	ULONG				cbDerivedKey,
+	ULONG				*pcbResult,
+	ULONG				dwFlags
+);
+
+HOOKDEF(BOOL, WINAPI, CryptSignMessage,
+	_In_ PCRYPT_SIGN_MESSAGE_PARA pSignPara,
+	_In_ BOOL fDetachedSignature,
+	_In_ DWORD cToBeSigned,
+	_In_ const BYTE *rgpbToBeSigned[],
+	_In_ DWORD rgcbToBeSigned[],
+	_Out_ BYTE *pbSignedBlob,
+	_Inout_ DWORD *pcbSignedBlob
+);
+
+HOOKDEF(BOOL, WINAPI, CryptVerifyMessageSignature,
+	_In_ PCRYPT_VERIFY_MESSAGE_PARA pVerifyPara,
+	_In_ DWORD dwSignerIndex,
+	_In_ const BYTE *pbDecoded,
+	_In_ DWORD cbDecoded,
+	_Out_opt_ BYTE *pbDecodedMsg,
+	_Inout_opt_ DWORD *pcbDecodedMsg,
+	_Out_opt_ PCCERT_CONTEXT *ppSignerCert
+);
+
+HOOKDEF(NTSTATUS, WINAPI, BCryptCreateHash,
+	BCRYPT_ALG_HANDLE hAlgorithm,
+	BCRYPT_HASH_HANDLE *phHash,
+	PUCHAR pbHashObject,
+	ULONG cbHashObject,
+	PUCHAR pbSecret,
+	ULONG cbSecret,
+	ULONG dwFlags
+);
+
+HOOKDEF(NTSTATUS, WINAPI, BCryptDestroyHash,
+	BCRYPT_HASH_HANDLE hHash
+);
+
+HOOKDEF(NTSTATUS, WINAPI, BCryptGenRandom,
+	BCRYPT_ALG_HANDLE hAlgorithm,
+	PUCHAR pbBuffer,
+	ULONG cbBuffer,
+	ULONG dwFlags
+);
+
+HOOKDEF(NTSTATUS, WINAPI, BCryptOpenAlgorithmProvider,
+	BCRYPT_ALG_HANDLE *phAlgorithm,
+	LPCWSTR pszAlgId,
+	LPCWSTR pszImplementation,
+	ULONG dwFlags
+);
+
+HOOKDEF(NTSTATUS, WINAPI, BCryptCloseAlgorithmProvider,
+	BCRYPT_ALG_HANDLE hAlgorithm,
+	ULONG dwFlags
+);
+
+HOOKDEF(SECURITY_STATUS, WINAPI, NCryptCreatePersistedKey,
+	NCRYPT_PROV_HANDLE hProvider,
+	NCRYPT_KEY_HANDLE *phKey,
+	LPCWSTR pszAlgId,
+	LPCWSTR pszKeyName,
+	DWORD dwLegacyKeySpec,
+	DWORD dwFlags
+);
+
+HOOKDEF(SECURITY_STATUS, WINAPI, NCryptFinalizeKey,
+	NCRYPT_KEY_HANDLE hKey,
+	DWORD dwFlags
+);
+
+HOOKDEF(SECURITY_STATUS, WINAPI, NCryptOpenKey,
+	NCRYPT_PROV_HANDLE hProvider,
+	NCRYPT_KEY_HANDLE *phKey,
+	LPCWSTR pszKeyName,
+	DWORD dwLegacyKeySpec,
+	DWORD dwFlags
+);
+
+HOOKDEF(BOOLEAN, WINAPI, SystemFunction036,
+	_Out_ PVOID RandomBuffer,
+	_In_  ULONG RandomBufferLength
+);
+
+HOOKDEF(NTSTATUS, WINAPI, SystemFunction040,
+	_Inout_ PVOID  Memory,
+	_In_    ULONG  MemorySize,
+	_In_    ULONG  OptionFlags
+);
+
+HOOKDEF(NTSTATUS, WINAPI, SystemFunction041,
+    _Inout_ PVOID  Memory,
+    _In_    ULONG  MemorySize,
+    _In_    ULONG  OptionFlags
+);
+
+//
+// Event Trace Hooks
+//
+
+HOOKDEF(ULONG, WINAPI, CloseTrace,
+	_In_ TRACEHANDLE TraceHandle
+);
+
+HOOKDEF(ULONG, WINAPI, ControlTraceA,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCTSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties,
+	_In_ ULONG ControlCode
+);
+
+HOOKDEF(ULONG, WINAPI, ControlTraceW,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCWSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties,
+	_In_ ULONG ControlCode
+);
+
+HOOKDEF(ULONG, WINAPI, EnableTrace,
+	_In_ ULONG Enable,
+	_In_ ULONG EnableFlag,
+	_In_ ULONG EnableLevel,
+	_In_ LPCGUID ControlGuid,
+	_In_ TRACEHANDLE SessionHandle
+);
+
+HOOKDEF(ULONG, WINAPI, EnableTraceEx,
+	_In_ LPCGUID ProviderId,
+	_In_opt_ LPCGUID SourceId,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ ULONG IsEnabled,
+	_In_ UCHAR Level,
+	_In_ ULONGLONG MatchAnyKeyword,
+	_In_ ULONGLONG MatchAllKeyword,
+	_In_ ULONG EnableProperty,
+	_In_opt_ PEVENT_FILTER_DESCRIPTOR EnableFilterDesc
+);
+
+HOOKDEF(ULONG, WINAPI, EnableTraceEx2,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCGUID ProviderId,
+	_In_ ULONG ControlCode,
+	_In_ UCHAR Level,
+	_In_ ULONGLONG MatchAnyKeyword,
+	_In_ ULONGLONG MatchAllKeyword,
+	_In_ ULONG Timeout,
+	_In_opt_ PENABLE_TRACE_PARAMETERS EnableParameters
+);
+
+HOOKDEF(TRACEHANDLE, WINAPI, OpenTraceA,
+	_Inout_ PEVENT_TRACE_LOGFILEA Logfile
+);
+
+HOOKDEF(TRACEHANDLE, WINAPI, OpenTraceW,
+	_Inout_ PEVENT_TRACE_LOGFILEW Logfile
+);
+
+HOOKDEF(ULONG, WINAPI, QueryAllTracesA,
+	_Out_ PEVENT_TRACE_PROPERTIES* PropertyArray,
+	_In_ ULONG PropertyArrayCount,
+	_Out_ PULONG LoggerCount
+);
+
+HOOKDEF(ULONG, WINAPI, QueryAllTracesW,
+	_Out_ PEVENT_TRACE_PROPERTIES* PropertyArray,
+	_In_ ULONG PropertyArrayCount,
+	_Out_ PULONG LoggerCount
+);
+
+HOOKDEF(ULONG, WINAPI, QueryTraceA,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCTSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(ULONG, WINAPI, QueryTraceW,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCWSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(ULONG, WINAPI, StartTraceA,
+	_Out_ PTRACEHANDLE TraceHandle,
+	_In_ LPCTSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(ULONG, WINAPI, StartTraceW,
+	_Out_ PTRACEHANDLE TraceHandle,
+	_In_ LPCWSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(ULONG, WINAPI, StopTraceA,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCTSTR InstanceName,
+	_Out_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(ULONG, WINAPI, StopTraceW,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCWSTR InstanceName,
+	_Out_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(ULONG, WINAPI, UpdateTraceA,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCTSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(ULONG, WINAPI, UpdateTraceW,
+	_In_ TRACEHANDLE TraceHandle,
+	_In_ LPCWSTR InstanceName,
+	_Inout_ PEVENT_TRACE_PROPERTIES Properties
+);
+
+HOOKDEF(LONG, WINAPI, CveEventWrite,
+	_In_ PCWSTR CveId,
+	_In_opt_ PCWSTR AdditionalDetails
+);
+
+HOOKDEF(ULONG, WINAPI, EventAccessControl,
+	_In_ LPGUID Guid,
+	_In_ ULONG Operation,
+	_In_ PSID Sid,
+	_In_ ULONG Rights,
+	_In_ BOOLEAN AllowOrDeny
+);
+
+HOOKDEF(ULONG, WINAPI, EventAccessQuery,
+	_In_ LPGUID Guid,
+	_Inout_ PSECURITY_DESCRIPTOR Buffer,
+	_Inout_ PULONG BufferSize
+);
+
+HOOKDEF(ULONG, WINAPI, EventAccessRemove,
+	_In_ LPGUID Guid
+);
+
+HOOKDEF(ULONG, WINAPI, EventRegister,
+	_In_ LPCGUID ProviderId,
+	_In_opt_ PENABLECALLBACK EnableCallback,
+	_In_opt_ PVOID CallbackContext,
+	_Out_ PREGHANDLE RegHandle
+);
+
+HOOKDEF(ULONG, WINAPI, EventSetInformation,
+	_In_ REGHANDLE RegHandle,
+	_In_ EVENT_INFO_CLASS InformationClass,
+	_In_ PVOID EventInformation,
+	_In_ ULONG InformationLength
+);
+
+HOOKDEF(ULONG, WINAPI, EventUnregister,
+	_In_ REGHANDLE RegHandle
 );
 
 //
@@ -3538,6 +4079,16 @@ HOOKDEF(NTSTATUS, WINAPI, SslExpandExporterMasterKey,
 	_In_		DWORD				dwFlags
 );
 
+HOOKDEF(NTSTATUS, WINAPI, BCryptDeriveKey,
+	_In_		PVOID				hSharedSecret,
+	_In_		LPCWSTR				pwszKDF,
+	_In_opt_	PNCryptBufferDesc	pParameterList,
+	_Out_opt_	PUCHAR				pbDerivedKey,
+	_In_		ULONG				cbDerivedKey,
+	_Out_		ULONG				*pcbResult,
+	_In_		ULONG				dwFlags
+);
+
 HOOKDEF(NTSTATUS, WINAPI, SslGenerateSessionKeys,
 	_In_	NCRYPT_PROV_HANDLE	hSslProvider,
 	_In_	NCRYPT_KEY_HANDLE	hMasterKey,
@@ -3564,32 +4115,17 @@ HOOKDEF(HRESULT, WINAPI, IsValidURL,
 	_Reserved_ DWORD   dwReserved
 );
 
-HOOKDEF(int, WINAPI, MultiByteToWideChar,
-	__in		UINT	CodePage,
-	__in		DWORD	dwFlags,
-	__in		LPCCH	lpMultiByteStr,
-	__in		int		cbMultiByte,
-	__out_opt	LPWSTR	lpWideCharStr,
-	__in		int		cchWideChar
-);
-
-HOOKDEF(int, WINAPI, WideCharToMultiByte,
-	__in		UINT	CodePage,
-	__in		DWORD	dwFlags,
-	__in		LPCWCH	lpWideCharStr,
-	__in		int		cchWideChar,
-	__out_opt	LPSTR	lpMultiByteStr,
-	__in		int		cbMultiByte,
-	__in_opt	LPCCH	lpDefaultChar,
-	__out_opt	LPBOOL	lpUsedDefaultChar
-);
-
 HOOKDEF(LPSTR, WINAPI, GetCommandLineA,
 	void
 );
 
 HOOKDEF(LPWSTR, WINAPI, GetCommandLineW,
 	void
+);
+
+HOOKDEF(LPWSTR, WINAPI, CommandLineToArgvW,
+	__in LPWSTR lpCmdLine,
+	__out int *pNumArgs
 );
 
 HOOKDEF(BOOL, WINAPI, DisableThreadLibraryCalls,
@@ -3636,6 +4172,56 @@ HOOKDEF(BOOL, WINAPI, EnumDisplayDevicesW,
 	_In_	DWORD    iDevNum,
 	_Out_   PDISPLAY_DEVICEW lpDisplayDevice,
 	_In_	DWORD    dwFlags
+);
+
+HOOKDEF(HRESULT, WINAPI, MkParseDisplayName,
+	_In_  PVOID pbc,
+	_In_  LPWSTR szName,
+	_Out_ ULONG *pchEaten,
+	_Out_ PVOID ppmk
+);
+
+HOOKDEF(HRESULT, WINAPI, MkParseDisplayNameEx,
+	_In_  PVOID pbc,
+	_In_  LPWSTR szName,
+	_Out_ ULONG *pchEaten,
+	_Out_ PVOID ppmk
+);
+HOOKDEF(UINT, WINAPI, MsiInstallProductA,
+	_In_	LPCSTR	szPackagePath,
+	_In_	LPCSTR	szCommandLine
+);
+
+HOOKDEF(UINT, WINAPI, MsiInstallProductW,
+	_In_	LPCWSTR	szPackagePath,
+	_In_	LPCWSTR	szCommandLine
+);
+
+HOOKDEF(ULONG, __fastcall, vDbgPrintExWithPrefixInternal,
+	__in  PCH Prefix,
+	__in  ULONG ComponentId,
+	__in  ULONG Level,
+	__in  PCHAR Format,
+	__in  va_list arglist,
+	__in  BOOLEAN HandleBreakpoint
+); 
+
+HOOKDEF(NTSTATUS, WINAPI, NtPowerInformation,
+	__in		POWER_INFORMATION_LEVEL InformationLevel,
+	__in_opt	PVOID                   InputBuffer,
+	__in		ULONG                   InputBufferLength,
+	__out_opt	PVOID                   OutputBuffer,
+	__in		ULONG                   OutputBufferLength
+);
+
+HOOKDEF(int, __fastcall, FindFixAndRun,
+	struct	cmdnode	*cmdnode
+);
+
+HOOKDEF(DWORD, WINAPI, MapFileAndCheckSumA,
+	_In_  PCSTR Filename,
+	_Out_ PDWORD HeaderSum,
+	_Out_ PDWORD CheckSum
 );
 
 #include "hook_vbscript.h"

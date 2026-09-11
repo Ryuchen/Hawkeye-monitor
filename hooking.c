@@ -156,12 +156,27 @@ int hook_is_excluded(hook_t *h)
 {
 	unsigned int i;
 
+	if (g_config.included_apinames[0] != NULL) {
+		int found = 0;
+		for (i = 0; i < ARRAYSIZE(g_config.included_apinames); i++) {
+			if (!g_config.included_apinames[i])
+				break;
+			if (!stricmp(h->funcname, g_config.included_apinames[i])) {
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			return 1;
+	}
+
 	for (i = 0; i < ARRAYSIZE(g_config.excluded_apinames); i++) {
 		if (!g_config.excluded_apinames[i])
 			break;
 		if (!stricmp(h->funcname, g_config.excluded_apinames[i]))
 			return 1;
 	}
+
 	for (i = 0; i < ARRAYSIZE(g_config.excluded_dllnames); i++) {
 		if (!g_config.excluded_dllnames[i])
 			break;
@@ -184,10 +199,14 @@ int add_hook_exclusion(const char *apiname)
 	return 0;
 }
 
+extern void start_transparent_hooks();
+extern void end_transparent_hooks();
+
 int addr_in_our_dll_range(void *unused, ULONG_PTR addr)
 {
 	if (addr >= g_our_dll_base && addr < (g_our_dll_base + g_our_dll_size))
-		return 1;
+		if (addr < (ULONG_PTR)&start_transparent_hooks || addr >= (ULONG_PTR)&end_transparent_hooks)
+			return 1;
 	return 0;
 }
 
@@ -274,6 +293,9 @@ void api_dispatch(hook_t *h, hook_info_t *hookinfo)
 		else
 			BreakpointOnReturn((PVOID)hookinfo->return_address);
 	}
+
+	if (g_config.hook_watch)
+		DebugOutput("api_dispatch: %s\n", h->funcname);
 }
 
 void add_force_hook_thread_func(const char* function)

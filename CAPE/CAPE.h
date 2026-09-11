@@ -27,7 +27,7 @@ extern CHAR s_szDllPath[MAX_PATH];
 #define PE_MIN_SIZE	 ((ULONG)0x800)
 #define PE_MAX_SECTIONS 0xFFFF
 #define REGISTRY_VALUE_SIZE_MIN 1024
-#define ENTROPY_DELTA  0.5
+#define ENTROPY_DELTA  0.005
 
 typedef PVOID(WINAPI *_getJit)(void);
 
@@ -39,14 +39,16 @@ PVOID GetHookCallerBase();
 BOOL InsideMonitor(PVOID* ReturnAddress, PVOID Address);
 PVOID GetPageAddress(PVOID Address);
 PVOID GetAllocationBase(PVOID Address);
+PVOID GetBaseAddress(PVOID Address);
 SIZE_T GetRegionSize(PVOID Address);
 SIZE_T GetAllocationSize(PVOID Address);
 SIZE_T GetAccessibleSize(PVOID Address);
+PVOID GetFunctionByName(HMODULE ModuleBase, PCHAR FunctionName);
 PVOID GetFunctionAddress(HMODULE ModuleBase, PCHAR FunctionName);
 BOOL IsAddressAccessible(PVOID Address);
 BOOL IsAddressExecutable(PVOID Address);
 BOOL TestPERequirements(PIMAGE_NT_HEADERS pNtHeader);
-SIZE_T GetMinPESize(PIMAGE_NT_HEADERS pNtHeader);
+SIZE_T GetMinPESize(PIMAGE_DOS_HEADER pDosHeader);
 double GetEntropy(PUCHAR Buffer);
 void SanitiseString(char *Dst, const char *Src, size_t Size);
 PCHAR TranslatePathFromDeviceToLetter(PCHAR DeviceFilePath);
@@ -77,9 +79,10 @@ int DumpImageInCurrentProcess(PVOID ImageBase);
 void DumpSectionViewsForPid(DWORD Pid);
 BOOL DumpRange(PVOID Address, SIZE_T Size);
 BOOL DumpStackRegion(void);
+void DumpStrings(void);
 
 BOOL ProcessDumped;
-unsigned int DumpCount;
+unsigned int DumpCount, DotNetCacheDumpCount;
 
 SYSTEM_INFO SystemInfo;
 PVOID CallingModule;
